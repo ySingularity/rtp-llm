@@ -36,4 +36,8 @@ from rtp_llm.models_py.modules.fmha import FMHAImplBase
 from rtp_llm.models_py.modules.kvcache_store import WriteCacheStoreOp
 from rtp_llm.models_py.modules.linear import LinearTorch
 from rtp_llm.models_py.modules.mlp import DenseMLP
+from rtp_llm.models_py.modules.multimodal_embedding import (
+    MultimodalDeepstackInjector,
+    MultimodalEmbeddingInjector,
+)
 from rtp_llm.models_py.modules.norm import AddBiasResLayerNorm, LayerNorm, RMSNormTorch

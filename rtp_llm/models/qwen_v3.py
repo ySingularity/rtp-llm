@@ -8,6 +8,8 @@ from rtp_llm.models.downstream_modules.reranker.qwen3_reranker import (
     Qwen3RerankerModule,
 )
 from rtp_llm.models.qwen_v2 import QWenV2, QWenV2Weight
+from rtp_llm.models_py.model_desc.module_base import GptModelBase
+from rtp_llm.models_py.model_desc.qwen3vl import Qwen3VLModel
 
 
 class QWenV3Weight(QWenV2Weight):
@@ -20,6 +22,9 @@ class QwenV3(QWenV2):
     @staticmethod
     def get_weight_cls():
         return QWenV3Weight
+
+    def _create_python_model(self) -> Optional[GptModelBase]:
+        self.py_model = Qwen3VLModel(self.config, self.weight)
 
     @classmethod
     def _create_config(cls, ckpt_path: str):

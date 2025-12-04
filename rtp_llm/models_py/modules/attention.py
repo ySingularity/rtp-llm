@@ -45,6 +45,7 @@ class CausalAttention(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
+        position_ids: torch.Tensor,
         fmha_impl: FMHAImplBase,
         kv_cache: Optional[KVCache],
     ) -> torch.Tensor:
@@ -52,7 +53,7 @@ class CausalAttention(nn.Module):
         qkv = self.qkv_proj(hidden_states)
         if self.qk_fuse_norm is not None:
             qkv = self.qk_fuse_norm(qkv)
-        attn_output = fmha_impl.forward(qkv, kv_cache)
+        attn_output = fmha_impl.forward(qkv, position_ids, kv_cache)
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
 
         output = self.o_proj(attn_output)

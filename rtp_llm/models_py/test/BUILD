@@ -7,6 +7,8 @@ py_test_deps = [
     "//rtp_llm/models_py/standalone:py_standalone_testlib",
 ]
 
+
+
 py_test (
     name = "norm_test",
     srcs = ["norm_test.py"],
@@ -289,5 +291,13 @@ py_test (
     deps = py_test_deps,
     env = test_envs,
     tags = ["open_skip", "H20"],
+    exec_properties = {'gpu':'H20'},
+)
+
+py_test (
+    name = "multimodal_embedding_test",
+    srcs = ["multimodal_embedding_test.py"],
+    deps = py_test_deps,
+    env = test_envs,
     exec_properties = {'gpu':'H20'},
 )

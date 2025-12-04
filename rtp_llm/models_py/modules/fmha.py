@@ -44,10 +44,12 @@ class FMHAImplBase(object):
                     self.attn_inputs.cache_store_inputs,
                 )
 
-    def forward(self, qkv: torch.Tensor, kv_cache: Optional[KVCache]) -> torch.Tensor:
+    def forward(
+        self, qkv: torch.Tensor, position_ids: torch.Tensor, kv_cache: Optional[KVCache]
+    ) -> torch.Tensor:
         assert self.rope_kvcache_impl is not None and self.rope_params is not None
         fmha_input = self.rope_kvcache_impl.forward(
-            qkv, self.fmha_type(), kv_cache, self.rope_params
+            qkv, position_ids, self.fmha_type(), kv_cache, self.rope_params
         )
         if (
             self.attn_inputs.is_prefill

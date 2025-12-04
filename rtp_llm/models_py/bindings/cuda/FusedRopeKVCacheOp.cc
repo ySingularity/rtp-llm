@@ -40,6 +40,7 @@ TRTAttnPtr FusedRopeKVCachePrefillOp::prepare(torch_ext::PyAttentionInputs attn_
 }
 
 torch::Tensor FusedRopeKVCachePrefillOp::forward(const torch::Tensor&              qkv,
+                                                 const torch::Tensor&              position_ids,
                                                  FMHAType                          fmha_type,
                                                  std::optional<torch_ext::KVCache> kv_cache,
                                                  const TRTAttnPtr&                 params) {
@@ -91,7 +92,11 @@ torch::Tensor FusedRopeKVCachePrefillOp::forward(const torch::Tensor&           
         padding_offset = params->padding_offset.data_ptr<int>();
     }
     // tmp not use qkv fp8 buffer
-    bool use_qkv_fp8 = false;
+    bool use_qkv_fp8      = false;
+    int* position_ids_ptr = nullptr;
+    if (position_ids.defined() && position_ids.numel() > 0) {
+        position_ids_ptr = position_ids.data_ptr<int>();
+    }
     DISPATCH_CUDA_FUNCTION_DATA_TYPE(
         torchDTypeToDataType(qkv.dtype()),
         invokeAddFusedQKVBiasTranspose,
@@ -102,10 +107,11 @@ torch::Tensor FusedRopeKVCachePrefillOp::forward(const torch::Tensor&           
         &prefix_prompt_param,
         qkv.data_ptr(),
         use_qkv_fp8 ? qkv_fp8.data_ptr() : nullptr,
-        nullptr,  // params.common.position_ids ? params.common.position_ids->dataWithOffset<int>(decoder_batch_size *
-                  // params.configs.rope_config.index_factor): nullptr,
-        nullptr,  // params.configs.fuse_qkv_add_bias && params.weights.qkv_weight->bias ?
-                  // params.weights.qkv_weight->bias->data() : nullptr,
+        position_ids_ptr,  // params.common.position_ids ?
+                           // params.common.position_ids->dataWithOffset<int>(decoder_batch_size
+                           // * params.configs.rope_config.index_factor): nullptr,
+        nullptr,           // params.configs.fuse_qkv_add_bias && params.weights.qkv_weight->bias ?
+                           // params.weights.qkv_weight->bias->data() : nullptr,
         padding_offset,
         params->cu_seqlens.data_ptr<int>(),
         batch_size,
@@ -168,6 +174,7 @@ TRTAttnPtr FusedRopeKVCacheDecodeOp::prepare(torch_ext::PyAttentionInputs attn_i
 static std::once_flag rope_cache_flag;
 
 torch::Tensor FusedRopeKVCacheDecodeOp::forward(const torch::Tensor&              qkv,
+                                                const torch::Tensor&              position_ids,
                                                 FMHAType                          fmha_type,
                                                 std::optional<torch_ext::KVCache> kv_cache,
                                                 const TRTAttnPtr&                 params) {
@@ -195,6 +202,11 @@ torch::Tensor FusedRopeKVCacheDecodeOp::forward(const torch::Tensor&            
         }
     });
 
+    int* position_ids_ptr = nullptr;
+    if (position_ids.defined() && position_ids.numel() > 0) {
+        position_ids_ptr = position_ids.data_ptr<int>();
+    }
+
     RTP_LLM_CHECK_WITH_INFO(params->sequence_lengths.is_pinned(), "sequence_lengths is not pinned memory");
     DISPATCH_CUDA_FUNCTION_DATA_TYPE(torchDTypeToDataType(qkv.dtype()),
                                      invokeDecodeAddFusedQKVBiasTranspose,
@@ -203,7 +215,7 @@ torch::Tensor FusedRopeKVCacheDecodeOp::forward(const torch::Tensor&            
                                      nullptr,  // v_buf
                                      kv_block_array,
                                      qkv.data_ptr(),
-                                     params->sequence_lengths.data_ptr<int>(),
+                                     position_ids_ptr,
                                      nullptr,  // params.configs.fuse_qkv_add_bias && params.weights.qkv_weight->bias ?
                                                // params.weights.qkv_weight->bias->data() : nullptr,
                                      use_rope_cache && rope_cache.defined() ? rope_cache.data_ptr<float>() : nullptr,
@@ -229,6 +241,7 @@ void registerFusedRopeKVCacheOp(const py::module& m) {
         .def("forward",
              &FusedRopeKVCachePrefillOp::forward,
              py::arg("qkv"),
+             py::arg("position_ids"),
              py::arg("fmha_type"),
              py::arg("kv_cache"),
              py::arg("params"));
@@ -239,6 +252,7 @@ void registerFusedRopeKVCacheOp(const py::module& m) {
         .def("forward",
              &FusedRopeKVCacheDecodeOp::forward,
              py::arg("qkv"),
+             py::arg("position_ids"),
              py::arg("fmha_type"),
              py::arg("kv_cache"),
              py::arg("params"));

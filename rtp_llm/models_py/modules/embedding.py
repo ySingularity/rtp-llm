@@ -22,13 +22,21 @@ class Embedding(nn.Module):
         self.weight = weight
         self.config = config
 
-    def forward(self, input: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        input: torch.Tensor,
+        position_ids: torch.Tensor,
+        token_types: torch.Tensor,
+        text_tokens_mask: torch.Tensor,
+    ) -> torch.Tensor:
         tokens = input.size(0)
         hidden_size = self.weight.size(-1)
         output = torch.empty(
             (tokens, hidden_size), dtype=self.weight.dtype, device=input.device
         )
-        rtp_llm_ops.embedding(output, input, self.weight.data)
+        rtp_llm_ops.embedding(
+            output, input, self.weight.data, position_ids, token_types, text_tokens_mask
+        )
         if self.config.tp_size > 1:
             m, n = output.shape
             output = all_gather(output, group=Group.TP)
