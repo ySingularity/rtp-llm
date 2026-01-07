@@ -6,6 +6,7 @@ import threading
 import time
 from typing import Any, Dict, List, Optional, Union
 
+import requests
 from anyio import CapacityLimiter
 from anyio.lowlevel import RunVar
 from fastapi import Body, FastAPI, HTTPException
@@ -24,6 +25,7 @@ from rtp_llm.config.uvicorn_config import get_uvicorn_logging_config
 from rtp_llm.embedding.embedding_type import TYPE_STR, EmbeddingType
 from rtp_llm.frontend.frontend_server import FrontendServer
 from rtp_llm.openai.api_datatype import ChatCompletionRequest
+from rtp_llm.ops import RoleType, VitSeparation
 from rtp_llm.utils.grpc_client_wrapper import GrpcClientWrapper
 from rtp_llm.utils.util import AtomicCounter, async_request_server
 from rtp_llm.utils.version_info import VersionInfo
@@ -184,6 +186,7 @@ class FrontendApp(object):
         @app.get("/status")
         @app.post("/status")
         @app.post("/health_check")
+        @app.get("/")
         async def health_check():
             if self.separated_frontend:
                 await check_all_health()
@@ -198,19 +201,7 @@ class FrontendApp(object):
                     status_code=400,
                     content={"error": f" HTTP health check failed"},
                 )
-            return "ok"
 
-        @app.get("/")
-        async def health():
-            if self.separated_frontend:
-                await check_all_health()
-                return {"status": "home"}
-            response = await self.grpc_client.post_request("health_check", {})
-            if response.get("status", "") != "ok":
-                return ORJSONResponse(
-                    status_code=400,
-                    content={"error": f" HTTP health check failed"},
-                )
             return "ok"
 
         @app.get("/cache_status")
