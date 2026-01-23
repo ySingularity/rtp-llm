@@ -28,6 +28,9 @@ def np_dtype_to_str(dtype: np.dtype) -> str:
 
 def str_to_np_dtype(dtype_str: str) -> np.dtype:
     """Converts a string representation of a NumPy dtype back to its corresponding dtype object."""
+    # NumPy doesn't support 'bfloat16' directly, need to use int16 as a workaround
+    if dtype_str == "bfloat16" or dtype_str == "torch.bfloat16":
+        return np.dtype(np.int16)
     return np.dtype(dtype_str)
 
 
@@ -155,20 +158,22 @@ class SharedMemoryIPCHelper:
             )
 
         try:
-            # Create a NumPy array that views the shared memory's buffer
-            # Use t.numpy() to get a NumPy array view (zero-copy for CPU tensors).
-            # Then copy data into the shared memory's buffer.
-            # Important: The dtype for the NumPy array viewing shm.buf must match the tensor's data type
-            shared_np_array = np.ndarray(
-                t.shape,
-                dtype=str_to_np_dtype(torch_dtype_to_str(t.dtype)),
-                buffer=shm.buf,
-            )
+            if t.dtype == torch.bfloat16:
+                t_int16 = t.view(torch.int16).contiguous()
+                shared_np_array = np.ndarray(
+                    t_int16.shape,
+                    dtype=np.int16,
+                    buffer=shm.buf,
+                )
+                shared_np_array[:] = t_int16.numpy()[:]
+            else:
+                shared_np_array = np.ndarray(
+                    t.shape,
+                    dtype=str_to_np_dtype(torch_dtype_to_str(t.dtype)),
+                    buffer=shm.buf,
+                )
+                shared_np_array[:] = t.numpy()[:]
 
-            # Copy data from PyTorch tensor's NumPy view to the shared NumPy array
-            shared_np_array[:] = t.numpy()[:]
-
-            # Get the name of the shared memory block from the provided object
             shm_name = shm.name
 
             meta = SharedMemIpcMeta(
@@ -198,25 +203,29 @@ class SharedMemoryIPCHelper:
 
         shm = None
         try:
-            # Attach to the shared memory block
             shm = shared_memory.SharedMemory(name=m.shm_name)
 
-            # Create a NumPy array view into the shared memory
-            np_dtype = str_to_np_dtype(
-                torch_dtype_to_str(m.dtype)
-            )  # Convert PyTorch dtype string to NumPy dtype
-            shared_np_array = np.ndarray(
-                m.shape,
-                dtype=np_dtype,
-                buffer=shm.buf,
-                offset=m.offset_bytes,
-                strides=[s * m.dtype.itemsize for s in m.stride],
-            )
+            if m.dtype == torch.bfloat16:
+                shared_np_array = np.ndarray(
+                    m.shape,
+                    dtype=np.int16,
+                    buffer=shm.buf,
+                    offset=m.offset_bytes,
+                    strides=[s * m.dtype.itemsize for s in m.stride],
+                )
+                int16_tensor = torch.from_numpy(shared_np_array)
+                rebuilt_tensor = int16_tensor.view(torch.bfloat16)
+            else:
+                np_dtype = str_to_np_dtype(torch_dtype_to_str(m.dtype))
+                shared_np_array = np.ndarray(
+                    m.shape,
+                    dtype=np_dtype,
+                    buffer=shm.buf,
+                    offset=m.offset_bytes,
+                    strides=[s * m.dtype.itemsize for s in m.stride],
+                )
+                rebuilt_tensor = torch.from_numpy(shared_np_array)
 
-            # Create a PyTorch tensor from the NumPy array (zero-copy on CPU)
-            rebuilt_tensor = torch.from_numpy(shared_np_array)
-
-            # clone tensor here, so that we can close shm obj ASAP.
             rebuilt_tensor = rebuilt_tensor.clone()
             if shm:
                 shm.close()

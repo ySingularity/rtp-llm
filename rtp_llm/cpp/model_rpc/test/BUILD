@@ -62,3 +62,16 @@ cc_test(
     exec_properties = {'gpu':'A10'},
 )
 
+cc_test(
+    name = "shared_memory_helper_test",
+    srcs = [
+        "SharedMemoryHelperTest.cc",
+    ],
+    copts = test_copts,
+    deps = test_deps,
+    env = {
+        "TEST_USING_DEVICE": "CUDA",
+    },
+    exec_properties = {'gpu':'A10'},
+)
+

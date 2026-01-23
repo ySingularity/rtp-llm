@@ -220,3 +220,19 @@ def init_vit_group_args(parser, vit_config):
         default="round_robin",
         help="VIT代理服务器的负载均衡策略，可选值: 'round_robin' 或 'least_connections'",
     )
+    vit_group.add_argument(
+        "--vit_use_shared_memory",
+        env_name="VIT_USE_SHARED_MEMORY",
+        bind_to=(vit_config, "vit_use_shared_memory"),
+        type=bool,
+        default=False,
+        help="是否使用共享内存进行tensor传输（提高性能，减少序列化开销）",
+    )
+    vit_group.add_argument(
+        "--vit_shm_cleanup_delay_seconds",
+        env_name="VIT_SHM_CLEANUP_DELAY_SECONDS",
+        bind_to=(vit_config, "vit_shm_cleanup_delay_seconds"),
+        type=int,
+        default=30,
+        help="共享内存清理延迟时间（秒），确保C++端有足够时间读取数据",
+    )

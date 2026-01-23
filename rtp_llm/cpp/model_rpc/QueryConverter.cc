@@ -5,6 +5,7 @@
 #include "rtp_llm/cpp/core/Types.h"
 #include "rtp_llm/cpp/devices/DeviceFactory.h"
 #include "rtp_llm/cpp/model_rpc/proto/model_rpc_service.pb.h"
+#include "rtp_llm/cpp/model_rpc/SharedMemoryHelper.h"
 
 namespace rtp_llm {
 #define TRANS_OPTIONAL(name)                                                                                           \
@@ -217,6 +218,34 @@ MultimodalOutput QueryConverter::transMMOutput(const MultimodalOutputsPB* output
 }
 
 torch::Tensor QueryConverter::transTensor(const TensorPB& tensor_pb) {
+    if (tensor_pb.use_shared_memory() && tensor_pb.has_shared_memory_meta()) {
+        const auto& sm_meta_pb = tensor_pb.shared_memory_meta();
+
+        SharedMemTensorMeta meta;
+        meta.shm_name = sm_meta_pb.shm_name();
+
+        meta.shape.clear();
+        meta.shape.reserve(sm_meta_pb.shape_size());
+        for (int64_t dim : sm_meta_pb.shape()) {
+            meta.shape.push_back(dim);
+        }
+
+        meta.dtype = SharedMemoryHelper::dtypeFromString(sm_meta_pb.dtype());
+
+        meta.stride.clear();
+        if (sm_meta_pb.stride_size() > 0) {
+            meta.stride.reserve(sm_meta_pb.stride_size());
+            for (int64_t s : sm_meta_pb.stride()) {
+                meta.stride.push_back(s);
+            }
+        }
+
+        meta.offset_bytes = sm_meta_pb.offset_bytes();
+        meta.size_bytes   = sm_meta_pb.size_bytes();
+
+        return SharedMemoryHelper::tensorFromSharedMemory(meta);
+    }
+
     std::vector<int64_t> shape(tensor_pb.shape().begin(), tensor_pb.shape().end());
     void*                data_ptr = nullptr;
     switch (tensor_pb.data_type()) {
