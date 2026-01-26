@@ -181,6 +181,8 @@ class VitConfig:
         self.disable_access_log: bool = False
         self.use_local_preprocess: bool = False
         self.vit_proxy_load_balance_strategy: str = "round_robin"
+        self.vit_use_shared_memory: bool = False
+        self.vit_shm_cleanup_delay_seconds: int = 30
 
     def to_string(self):
         return (

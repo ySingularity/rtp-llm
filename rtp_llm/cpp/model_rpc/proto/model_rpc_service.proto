@@ -3,6 +3,17 @@ syntax = "proto3";
 import "google/protobuf/wrappers.proto";
 
 
+// Shared memory metadata for tensor transfer
+// Used when tensor data is stored in POSIX shared memory instead of protobuf bytes
+message SharedMemTensorMetaPB {
+    string shm_name = 1;              // Name of the shared memory object (e.g., "psm_xxxxx")
+    repeated int64 shape = 2;         // Tensor shape dimensions
+    string dtype = 3;                 // Tensor dtype as string: "float32", "int32", "float16", "bfloat16"
+    repeated int64 stride = 4;        // Tensor stride (optional, can be calculated if empty)
+    int64 offset_bytes = 5;           // Offset within the shared memory block (usually 0)
+    int64 size_bytes = 6;             // Total size of tensor data in bytes
+}
+
 message TensorPB {
     enum DataType {
         FP32 = 0;
@@ -16,6 +27,13 @@ message TensorPB {
     bytes int32_data = 4;
     bytes fp16_data = 5;
     bytes bf16_data = 6;
+
+    // Shared memory support (optional, for zero-copy tensor transfer)
+    // If use_shared_memory is true, the tensor data is in shared memory
+    // and only metadata is passed via protobuf. The actual data should be
+    // read from shared memory using the metadata in shared_memory_meta.
+    bool use_shared_memory = 7;
+    SharedMemTensorMetaPB shared_memory_meta = 8;
 }
 
 message IntVector {
