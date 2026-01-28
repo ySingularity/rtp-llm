@@ -2,6 +2,7 @@ import logging
 import os
 
 from rtp_llm.ops import VitSeparation
+from rtp_llm.server.server_args.util import str2bool
 
 
 def _convert_vit_separation(value):
@@ -106,7 +107,7 @@ def init_vit_group_args(parser, vit_config):
         "--use_igraph_cache",
         env_name="USE_IGRAPH_CACHE",
         bind_to=(vit_config, "use_igraph_cache"),
-        type=bool,
+        type=str2bool,
         default=True,
         help="访问igraph是否开启cache",
     )
@@ -160,7 +161,7 @@ def init_vit_group_args(parser, vit_config):
     vit_group.add_argument(
         "--biencoder_preprocess",
         env_name="BIENCODER_PREPROCESS",
-        type=bool,
+        type=str2bool,
         default=False,
         help="是否开启biencoder预处理",
     )
@@ -200,7 +201,7 @@ def init_vit_group_args(parser, vit_config):
         "--disable_access_log",
         env_name="DISABLE_ACCESS_LOG",
         bind_to=(vit_config, "disable_access_log"),
-        type=bool,
+        type=str2bool,
         default=False,
         help="是否禁用访问日志",
     )
@@ -208,7 +209,7 @@ def init_vit_group_args(parser, vit_config):
         "--use_local_preprocess",
         env_name="USE_LOCAL_PREPROCESS",
         bind_to=(vit_config, "use_local_preprocess"),
-        type=bool,
+        type=str2bool,
         default=False,
         help="是否使用本地预处理模式（不使用子进程）",
     )
