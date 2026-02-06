@@ -756,7 +756,6 @@ class KVCacheConfig:
     test_block_num: int
     use_block_cache: int
     write_cache_sync: bool
-
     def __getstate__(self) -> tuple:
         ...
 

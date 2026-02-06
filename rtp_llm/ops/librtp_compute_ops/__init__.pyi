@@ -3,7 +3,11 @@ import libth_transformer_config
 import torch
 import typing
 from . import rtp_llm_ops
+<<<<<<< HEAD
 __all__: list[str] = ['BertEmbeddingInputs', 'DeviceExporter', 'DeviceType', 'KVCache', 'ParamsBase', 'PyAttentionInputs', 'PyCacheStoreInputs', 'PyCaptureMetaData', 'PyContextParallelParams', 'PyModelInitResources', 'PyModelInputs', 'PyModelOutputs', 'PyPrefillCudaGaphCopyParams', 'TypeMeta', 'get_device', 'get_scalar_type', 'get_typemeta', 'init_device', 'rtp_llm_ops']
+=======
+__all__: list[str] = ['BertEmbeddingInputs', 'DeviceExporter', 'DeviceType', 'KVCache', 'ParamsBase', 'PyAttentionInputs', 'PyCacheStoreInputs', 'PyCaptureMetaData', 'PyEmbeddingInputs', 'PyModelInitResources', 'PyModelInputs', 'PyModelOutputs', 'PyMultimodalInputs', 'PyPrefillCudaGaphCopyParams', 'TypeMeta', 'get_device', 'get_scalar_type', 'get_typemeta', 'init_device', 'rtp_llm_ops']
+>>>>>>> fix: qwen3 vl moe py model and video input
 class BertEmbeddingInputs:
     @typing.overload
     def __init__(self) -> None:
@@ -154,8 +158,6 @@ class ParamsBase:
 class PyAttentionInputs:
     cache_store_inputs: PyCacheStoreInputs | None
     context_parallel_info: PyContextParallelParams | None
-    combo_position_ids: torch.Tensor
-    combo_tokens_type_ids: torch.Tensor
     context_total_kv_length: int
     cu_kv_seqlens: torch.Tensor
     cu_seqlens: torch.Tensor
@@ -168,18 +170,12 @@ class PyAttentionInputs:
     kv_cache_block_id_device: torch.Tensor
     kv_cache_block_id_device_by_group: list[torch.Tensor]
     kv_cache_block_id_host: torch.Tensor
-    kv_cache_block_id_host_by_group: list[torch.Tensor]
-    kv_cache_layer_to_group: torch.Tensor
-    mm_deepstack_embeds: list[torch.Tensor] | None
-    mm_features_locs: torch.Tensor | None
-    multimodal_features: list[torch.Tensor] | None
     padding_offset: torch.Tensor
     position_ids: torch.Tensor
     prefill_cuda_graph_copy_params: PyPrefillCudaGaphCopyParams | None
     prefix_lengths: torch.Tensor
     sequence_lengths: torch.Tensor
     sequence_lengths_plus_1_d: torch.Tensor
-    text_tokens_mask: torch.Tensor
     total_tokens: int
     is_s_padded: bool
     def __init__(self) -> None:
@@ -210,6 +206,27 @@ class PyContextParallelParams:
     prefill_shuffle_indices: torch.Tensor
     def __init__(self) -> None:
         ...
+class PyEmbeddingInputs:
+    def __init__(self) -> None:
+        ...
+    def __repr__(self) -> str:
+        ...
+    @property
+    def combo_tokens_type_ids(self) -> torch.Tensor:
+        """
+        Combined token type IDs tensor
+        """
+    @combo_tokens_type_ids.setter
+    def combo_tokens_type_ids(self, arg0: torch.Tensor) -> None:
+        ...
+    @property
+    def text_tokens_mask(self) -> torch.Tensor:
+        """
+        Text tokens mask tensor
+        """
+    @text_tokens_mask.setter
+    def text_tokens_mask(self, arg0: torch.Tensor) -> None:
+        ...
 class PyModelInitResources:
     def __init__(self) -> None:
         ...
@@ -223,7 +240,7 @@ class PyModelInputs:
     def __init__(self) -> None:
         ...
     @typing.overload
-    def __init__(self, input_ids: torch.Tensor = ..., input_hiddens: torch.Tensor = ..., attention_inputs: PyAttentionInputs = ..., bert_embedding_inputs: BertEmbeddingInputs = ...) -> None:
+    def __init__(self, input_ids: torch.Tensor = ..., input_hiddens: torch.Tensor = ..., combo_position_ids: torch.Tensor = ..., embedding_inputs: PyEmbeddingInputs = ..., multimodal_inputs: PyMultimodalInputs = ..., attention_inputs: PyAttentionInputs = ..., bert_embedding_inputs: BertEmbeddingInputs = ...) -> None:
         ...
     @property
     def attention_inputs(self) -> PyAttentionInputs:
@@ -242,6 +259,22 @@ class PyModelInputs:
     def bert_embedding_inputs(self, arg0: BertEmbeddingInputs) -> None:
         ...
     @property
+    def combo_position_ids(self) -> torch.Tensor:
+        """
+        Combo position IDs tensor
+        """
+    @combo_position_ids.setter
+    def combo_position_ids(self, arg0: torch.Tensor) -> None:
+        ...
+    @property
+    def embedding_inputs(self) -> PyEmbeddingInputs:
+        """
+        Embedding inputs structure
+        """
+    @embedding_inputs.setter
+    def embedding_inputs(self, arg0: PyEmbeddingInputs) -> None:
+        ...
+    @property
     def input_hiddens(self) -> torch.Tensor:
         """
         Input hidden states tensor
@@ -256,6 +289,14 @@ class PyModelInputs:
         """
     @input_ids.setter
     def input_ids(self, arg0: torch.Tensor) -> None:
+        ...
+    @property
+    def multimodal_inputs(self) -> PyMultimodalInputs:
+        """
+        Multimodal inputs structure
+        """
+    @multimodal_inputs.setter
+    def multimodal_inputs(self, arg0: PyMultimodalInputs) -> None:
         ...
 class PyModelOutputs:
     @typing.overload
@@ -288,6 +329,27 @@ class PyModelOutputs:
         """
     @params_ptr.setter
     def params_ptr(self, arg0: ParamsBase) -> None:
+        ...
+class PyMultimodalInputs:
+    def __init__(self) -> None:
+        ...
+    def __repr__(self) -> str:
+        ...
+    @property
+    def mm_deepstack_embeds(self) -> list[torch.Tensor]:
+        """
+        Multimodal deepstack embeds tensor
+        """
+    @mm_deepstack_embeds.setter
+    def mm_deepstack_embeds(self, arg0: list[torch.Tensor]) -> None:
+        ...
+    @property
+    def multimodal_features(self) -> list[torch.Tensor]:
+        """
+        Multimodal features tensor
+        """
+    @multimodal_features.setter
+    def multimodal_features(self, arg0: list[torch.Tensor]) -> None:
         ...
 class PyPrefillCudaGaphCopyParams:
     cuda_graph_prefill_batch_size: torch.Tensor
