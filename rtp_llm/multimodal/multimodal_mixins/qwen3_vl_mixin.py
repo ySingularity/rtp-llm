@@ -25,11 +25,8 @@ from rtp_llm.multimodal.multimodal_mixins.qwen2_5_vl.qwen2_5_vl_mixin import (
     smart_resize,
 )
 from rtp_llm.multimodal.multimodal_util import get_bytes_io_from_url
-from rtp_llm.utils.base_model_datatypes import (
-    MMPreprocessConfig,
-    MMUrlType,
-    MultimodalInput,
-)
+from rtp_llm.ops import MMPreprocessConfig, MultimodalInput
+from rtp_llm.utils.base_model_datatypes import MMUrlType
 from rtp_llm.utils.flash_attn_utils import can_use_flash_attn
 
 default_attn_impl = "sdpa"

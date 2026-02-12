@@ -78,16 +78,15 @@ class Qwen3VLMoeModel(GptModelBase):
 
     def forward(self, inputs: PyModelInputs, fmha_impl: Any = None) -> PyModelOutputs:
         input_ids: torch.Tensor = inputs.input_ids
-        attention_inputs: PyAttentionInputs = inputs.attention_inputs
         if fmha_impl is None:
             fmha_impl = AttnImplFactory.get_fmha_impl(inputs)
 
-        position_ids = attention_inputs.combo_position_ids
-        token_type_ids = attention_inputs.combo_tokens_type_ids
-        text_tokens_mask = attention_inputs.text_tokens_mask
-        mm_features = attention_inputs.multimodal_features
-        mm_feature_locs = attention_inputs.mm_features_locs
-        mm_deepstack_embeds = attention_inputs.mm_deepstack_embeds
+        position_ids = inputs.combo_position_ids
+        token_type_ids = inputs.embedding_inputs.combo_tokens_type_ids
+        text_tokens_mask = inputs.embedding_inputs.text_tokens_mask
+        mm_features = inputs.multimodal_inputs.multimodal_features
+        mm_feature_locs = inputs.multimodal_inputs.mm_features_locs
+        mm_deepstack_embeds = inputs.multimodal_inputs.mm_deepstack_embeds
 
         inputs_embeds = self.embed_tokens(
             input_ids, position_ids, token_type_ids, text_tokens_mask

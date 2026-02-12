@@ -14,7 +14,7 @@
 #include <c10/cuda/CUDAStream.h>
 #include "rtp_llm/cpp/devices/cuda_impl/CudaGraphRunner.h"
 #endif
-
+#include "rtp_llm/cpp/multimodal_processor/MultimodalTypes.h"
 namespace py = pybind11;
 
 namespace rtp_llm {
@@ -34,7 +34,10 @@ private:
 private:
     // Helper functions to reduce code duplication
     torch_ext::PyAttentionInputs   buildPyAttentionInputs(const GptModelInputs& inputs);
+    torch_ext::PyEmbeddingInputs   buildPyEmbeddingInputs(const GptModelInputs& inputs);
+    torch_ext::PyMultimodalInputs  buildPyMultimodalInputs(const GptModelInputs& inputs);
     torch_ext::BertEmbeddingInputs buildBertEmbeddingInputs(const GptModelInputs& inputs);
+    MultimodalInput                buildMultimodalInput(const GptModelInputs& inputs);
     void                           setupKVCacheForAttentionInputs(torch_ext::PyAttentionInputs& py_attn_inputs,
                                                                   const GptModelInputs&         inputs,
                                                                   BufferPtr&                    kv_cache_block_id_device);
@@ -74,7 +77,7 @@ inline PyWrappedModel::PyWrappedModel(const GptModelInitParams& params,
     torch_ext::PyModelInitResources init_resources;
     if (kv_cache_buffer_) {
         torch_ext::KVCache kv_cache;
-        kv_cache.kv_cache_base = kv_cache_base_tensor_;
+        kv_cache.kv_cache_base      = kv_cache_base_tensor_;
         kv_cache.seq_size_per_block = params.description.attention_conf.tokens_per_block;
         if (kv_scale_buffer_) {
             kv_cache.kv_scale_base = kv_scale_base_tensor_;
