@@ -101,7 +101,7 @@ class EmbeddingEndpoint(object):
         multimodal_features = []
 
         vit_role_addr = ""
-        if input.multimodal_inputs:
+        if input.multimodal_inputs and self.host_service:
             role_addrs = self.host_service.get_backend_role_addrs([RoleType.VIT])
             if role_addrs:
                 vit_role_addr = role_addrs[0].ip + ":" + str(role_addrs[0].grpc_port)
