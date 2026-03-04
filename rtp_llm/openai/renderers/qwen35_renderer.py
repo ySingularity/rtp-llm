@@ -1,17 +1,13 @@
 import json
 from typing import List
 
-from rtp_llm.openai.api_datatype import (
-    ChatCompletionRequest,
-    ChatMessage,
-    ContentPartTypeEnum,
-    MMUrlType,
-    PromptWithMMInput,
-    RenderedInputs,
-)
+from rtp_llm.openai.api_datatype import ChatCompletionRequest, ContentPartTypeEnum
 from rtp_llm.openai.renderer_factory_register import register_renderer
+from rtp_llm.openai.renderers.basic_renderer import PromptWithMMInput
+from rtp_llm.openai.renderers.custom_renderer import RenderedInputs
 from rtp_llm.openai.renderers.qwen3_code_renderer import Qwen3CoderRenderer
 from rtp_llm.ops import MMPreprocessConfig
+from rtp_llm.utils.base_model_datatypes import MMUrlType
 
 
 class Qwen35Renderer(Qwen3CoderRenderer):
@@ -44,12 +40,19 @@ class Qwen35Renderer(Qwen3CoderRenderer):
         urls = []
         types = []
         preprocess_configs = []
-        messages = request.messages
-        for message in messages:
-            if isinstance(message.content, list):
+        final_messages = []
+        for message in request.messages:
+            if isinstance(message.content, str):
+                final_messages.append(
+                    {"role": message.role.value, "content": message.content}
+                )
+            elif isinstance(message.content, list):
+                now_message = {"role": message.role.value}
+                now_content = []
                 for content_part in message.content:
                     if content_part.type == ContentPartTypeEnum.text:
-                        continue
+                        assert isinstance(content_part.text, str)
+                        now_content.append({"type": "text", "text": content_part.text})
                     elif content_part.type == ContentPartTypeEnum.image_url:
                         assert content_part.image_url != None
                         urls.append(content_part.image_url.url)
@@ -58,6 +61,9 @@ class Qwen35Renderer(Qwen3CoderRenderer):
                             preprocess_configs.append(
                                 get_preprocess_config(content_part.preprocess_config)
                             )
+                        now_content.append(
+                            {"type": "image", "image": content_part.image_url.url}
+                        )
                     elif content_part.type == ContentPartTypeEnum.video_url:
                         assert content_part.video_url != None
                         urls.append(content_part.video_url.url)
@@ -66,10 +72,19 @@ class Qwen35Renderer(Qwen3CoderRenderer):
                             preprocess_configs.append(
                                 get_preprocess_config(content_part.preprocess_config)
                             )
+                        now_content.append(
+                            {"type": "video", "image": content_part.video_url.url}
+                        )
+                now_message["content"] = now_content
+                final_messages.append(now_message)
 
         prompt = self.tokenizer.apply_chat_template(
-            request.messages.model_dump_json(exclude_none=True),
-            tools=request.tools.model_dump_json(exclude_none=True),
+            final_messages,
+            tools=(
+                [tool.model_dump_json(exclude_none=True) for tool in request.tools]
+                if request.tools
+                else None
+            ),
             tokenize=False,
             add_generation_prompt=True,
             add_vision_id=(

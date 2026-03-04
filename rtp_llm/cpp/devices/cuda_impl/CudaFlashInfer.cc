@@ -368,7 +368,8 @@ bool FlashInferAttnParams::check(rtp_llm::DeviceBase*             device,
         bool kv_cache_dtype_valid = (attn_configs.kv_cache_dtype == KvCacheDataType::BASE
                                      || attn_configs.kv_cache_dtype == KvCacheDataType::FP8);
         bool rope_style_valid =
-            (attn_configs.rope_config.style == RopeStyle::Base || attn_configs.rope_config.style == RopeStyle::No);
+            (attn_configs.rope_config.style == RopeStyle::Base || attn_configs.rope_config.style == RopeStyle::No
+             || attn_configs.rope_config.style == RopeStyle::Mrope);
         bool is_causal_valid = attn_configs.is_causal;
         bool q_scaling_valid = (attn_configs.q_scaling == 1.0f);
         bool logn_attn_valid = !attn_configs.use_logn_attn;
