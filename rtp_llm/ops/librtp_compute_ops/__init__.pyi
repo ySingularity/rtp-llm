@@ -3,11 +3,7 @@ import libth_transformer_config
 import torch
 import typing
 from . import rtp_llm_ops
-<<<<<<< HEAD
-__all__: list[str] = ['BertEmbeddingInputs', 'DeviceExporter', 'DeviceType', 'KVCache', 'ParamsBase', 'PyAttentionInputs', 'PyCacheStoreInputs', 'PyCaptureMetaData', 'PyContextParallelParams', 'PyModelInitResources', 'PyModelInputs', 'PyModelOutputs', 'PyPrefillCudaGaphCopyParams', 'TypeMeta', 'get_device', 'get_scalar_type', 'get_typemeta', 'init_device', 'rtp_llm_ops']
-=======
-__all__: list[str] = ['BertEmbeddingInputs', 'DeviceExporter', 'DeviceType', 'KVCache', 'ParamsBase', 'PyAttentionInputs', 'PyCacheStoreInputs', 'PyCaptureMetaData', 'PyEmbeddingInputs', 'PyModelInitResources', 'PyModelInputs', 'PyModelOutputs', 'PyMultimodalInputs', 'PyPrefillCudaGaphCopyParams', 'TypeMeta', 'get_device', 'get_scalar_type', 'get_typemeta', 'init_device', 'rtp_llm_ops']
->>>>>>> fix: qwen3 vl moe py model and video input
+__all__: list[str] = ['BertEmbeddingInputs', 'DeviceExporter', 'DeviceType', 'KVCache', 'ParamsBase', 'PyAttentionInputs', 'PyCacheStoreInputs', 'PyCaptureMetaData', 'PyContextParallelParams', 'PyEmbeddingInputs', 'PyModelInitResources', 'PyModelInputs', 'PyModelOutputs', 'PyMultimodalInputs', 'PyPrefillCudaGaphCopyParams', 'TypeMeta', 'get_device', 'get_scalar_type', 'get_typemeta', 'init_device', 'rtp_llm_ops']
 class BertEmbeddingInputs:
     @typing.overload
     def __init__(self) -> None:
@@ -71,17 +67,17 @@ class DeviceExporter:
 class DeviceType:
     """
     Members:
-
+    
       Cpu
-
+    
       Cuda
-
+    
       Yitian
-
+    
       ArmCpu
-
+    
       ROCm
-
+    
       Ppu
     """
     ArmCpu: typing.ClassVar[DeviceType]  # value = <DeviceType.ArmCpu: 3>
@@ -157,6 +153,7 @@ class ParamsBase:
         """
 class PyAttentionInputs:
     cache_store_inputs: PyCacheStoreInputs | None
+    combo_position_ids: torch.Tensor
     context_parallel_info: PyContextParallelParams | None
     context_total_kv_length: int
     cu_kv_seqlens: torch.Tensor
@@ -170,14 +167,14 @@ class PyAttentionInputs:
     kv_cache_block_id_device: torch.Tensor
     kv_cache_block_id_device_by_group: list[torch.Tensor]
     kv_cache_block_id_host: torch.Tensor
+    kv_cache_block_id_host_by_group: list[torch.Tensor]
+    kv_cache_layer_to_group: torch.Tensor
     padding_offset: torch.Tensor
-    position_ids: torch.Tensor
     prefill_cuda_graph_copy_params: PyPrefillCudaGaphCopyParams | None
     prefix_lengths: torch.Tensor
     sequence_lengths: torch.Tensor
     sequence_lengths_plus_1_d: torch.Tensor
     total_tokens: int
-    is_s_padded: bool
     def __init__(self) -> None:
         ...
     def __repr__(self) -> str:
@@ -342,6 +339,14 @@ class PyMultimodalInputs:
         """
     @mm_deepstack_embeds.setter
     def mm_deepstack_embeds(self, arg0: list[torch.Tensor]) -> None:
+        ...
+    @property
+    def mm_features_locs(self) -> torch.Tensor:
+        """
+        Multimodal features locations tensor
+        """
+    @mm_features_locs.setter
+    def mm_features_locs(self, arg0: torch.Tensor) -> None:
         ...
     @property
     def multimodal_features(self) -> list[torch.Tensor]:

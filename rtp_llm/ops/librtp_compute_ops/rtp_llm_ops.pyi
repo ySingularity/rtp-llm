@@ -6,7 +6,7 @@ import librtp_compute_ops
 import libth_transformer_config
 import torch
 import typing
-__all__: list[str] = ['FlashInferAttnParams', 'FlashInferDecodeOp', 'FlashInferMlaAttnParams', 'FlashInferPrefillOp', 'FusedMoEOp', 'FusedRopeKVCacheDecodeOp', 'FusedRopeKVCachePrefillOpQKVOut', 'FusedRopeKVCachePrefillOpQOut', 'GroupTopKOp', 'KVBlockArray', 'SelectTopkOp', 'TRTAttn', 'TRTAttnOp', 'TRTPagedAttnOp', 'XQAAttnOp', 'XQAParams', 'allocate_shared_buffer', 'cuda_graph_copy_large2small', 'cuda_graph_copy_small2large', 'cutlass_moe_mm', 'debug_kernel', 'dispose_communicator', 'embedding', 'embedding_bert', 'fill_mla_params', 'fused_add_layernorm', 'fused_add_rmsnorm', 'fused_qk_rmsnorm', 'get_cutlass_batched_moe_mm_data', 'get_cutlass_moe_mm_without_permute_info', 'init_communicator', 'layernorm', 'mla_k_merge', 'moe_post_reorder', 'moe_pre_reorder', 'moe_topk_softmax', 'open_ipc_handle', 'per_tensor_quant_fp8', 'per_token_group_quant_fp8', 'per_token_group_quant_fp8_v2', 'per_token_group_quant_int8', 'per_token_quant_fp8', 'register_buffer_to_communicator', 'reuse_kv_cache_indexed_batched', 'rmsnorm', 'silu_and_mul', 'trt_fp8_quantize_128', 'trt_fp8_quantize_128_inplace', 'userbuffers_recv', 'userbuffers_ring_all_gather', 'userbuffers_send', 'write_cache_store']
+__all__: list[str] = ['FlashInferAttnParams', 'FlashInferDecodeOp', 'FlashInferMlaAttnParams', 'FlashInferPrefillOp', 'FusedMoEOp', 'FusedRopeKVCacheDecodeOp', 'FusedRopeKVCachePrefillOpQKVOut', 'FusedRopeKVCachePrefillOpQOut', 'GroupTopKOp', 'KVBlockArray', 'SelectTopkOp', 'TRTAttn', 'TRTAttnOp', 'TRTPagedAttnOp', 'XQAAttnOp', 'XQAParams', 'allocate_shared_buffer', 'cuda_graph_copy_large2small', 'cuda_graph_copy_small2large', 'cutlass_moe_mm', 'cutlass_scaled_fp4_mm', 'debug_kernel', 'dispose_communicator', 'embedding', 'embedding_bert', 'fill_mla_params', 'fused_add_layernorm', 'fused_add_rmsnorm', 'fused_qk_rmsnorm', 'get_cutlass_batched_moe_mm_data', 'get_cutlass_moe_mm_without_permute_info', 'init_communicator', 'layernorm', 'mla_k_merge', 'moe_post_reorder', 'moe_pre_reorder', 'moe_topk_softmax', 'open_ipc_handle', 'per_tensor_quant_fp8', 'per_token_group_quant_fp8', 'per_token_group_quant_fp8_v2', 'per_token_group_quant_int8', 'per_token_quant_fp8', 'register_buffer_to_communicator', 'reuse_kv_cache_indexed_batched', 'rmsnorm', 'scaled_fp4_experts_quant', 'scaled_fp4_quant', 'silu_and_mul', 'silu_and_mul_scaled_fp4_experts_quant', 'trt_fp8_quantize_128', 'trt_fp8_quantize_128_inplace', 'userbuffers_recv', 'userbuffers_ring_all_gather', 'userbuffers_send', 'write_cache_store']
 class FlashInferAttnParams(librtp_compute_ops.ParamsBase):
     def __init__(self) -> None:
         ...
@@ -235,6 +235,8 @@ def cuda_graph_copy_small2large(input_tensor: torch.Tensor, output_tensor: torch
     """
 def cutlass_moe_mm(out_tensors: torch.Tensor, a_tensors: torch.Tensor, b_tensors: torch.Tensor, a_scales: torch.Tensor, b_scales: torch.Tensor, expert_offsets: torch.Tensor, problem_sizes: torch.Tensor, a_strides: torch.Tensor, b_strides: torch.Tensor, c_strides: torch.Tensor, per_act_token: bool, per_out_ch: bool, profile: bool = False, m_tile: int = 0, n_tile: int = 0, k_tile: int = 0, cluster_m: int = 0, cluster_n: int = 0, cluster_k: int = 0, swap_ab: bool = False) -> None:
     ...
+def cutlass_scaled_fp4_mm(out: torch.Tensor, a: torch.Tensor, b: torch.Tensor, a_sf: torch.Tensor, b_sf: torch.Tensor, alpha: torch.Tensor) -> None:
+    ...
 def debug_kernel(data: torch.Tensor, start_row: int, start_col: int, m: int, n: int, row_len: int, info_id: int) -> None:
     """
     Debug kernel to print 2D data blocks from GPU tensor
@@ -243,7 +245,7 @@ def dispose_communicator(comm_ptr: int) -> None:
     """
     Dispose UbCommunicator with python address and release resources
     """
-def embedding(output: torch.Tensor, input: torch.Tensor, weight: torch.Tensor) -> None:
+def embedding(output: torch.Tensor, input: torch.Tensor, weight: torch.Tensor, position_ids: torch.Tensor | None = None, token_type_ids: torch.Tensor | None = None, text_tokens_mask: torch.Tensor | None = None) -> None:
     """
     Embedding lookup kernel
     """
@@ -325,10 +327,16 @@ def rmsnorm(output: torch.Tensor, input: torch.Tensor, weight: torch.Tensor, eps
     """
     RMSNorm kernel
     """
+def scaled_fp4_experts_quant(output: torch.Tensor, output_scale: torch.Tensor, input: torch.Tensor, input_global_scale: torch.Tensor, input_offset_by_experts: torch.Tensor, output_scale_offset_by_experts: torch.Tensor) -> None:
+    ...
+def scaled_fp4_quant(output: torch.Tensor, input: torch.Tensor, output_sf: torch.Tensor, input_sf: torch.Tensor) -> None:
+    ...
 def silu_and_mul(output: torch.Tensor, input: torch.Tensor, cuda_stream: int = 0) -> None:
     """
     SiLU and Multiply kernel
     """
+def silu_and_mul_scaled_fp4_experts_quant(output: torch.Tensor, output_scale: torch.Tensor, input: torch.Tensor, input_global_scale: torch.Tensor, mask: torch.Tensor, use_silu_and_mul: bool) -> None:
+    ...
 def trt_fp8_quantize_128(input: torch.Tensor, col_major_scale: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Quantize BF16 weight matrix to FP8 format using 128-element block processing
