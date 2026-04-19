@@ -274,7 +274,8 @@ void CudaGraphRunner::prepareInputs(const PyModelInputs& inputs, CudaGraphState&
         }
 
         int last_valid_q = state.current_seq_len;
-        int last_valid_kv = last_valid_q
+        int last_valid_kv =
+            last_valid_q
             + inputs.attention_inputs.prefix_lengths.slice(0, 0, state.current_batch_size).sum().item<int>();
         py_model_inputs_.attention_inputs.cu_seqlens_host.slice(0, state.current_batch_size + 1, max_bs_ + 1)
             .fill_(last_valid_q);
@@ -637,7 +638,15 @@ void CudaGraphRunner::initCapture() {
         // get real output data type (params already prepared in attn impl __init__/create_params)
         auto attn_pyobj = py_attn_pyobj_method_(capture_mem_hold_.py_model_inputs_, true);
         RTP_LLM_LOG_INFO("initCapture forward for output datatype start");
-        py_forward_method_(capture_mem_hold_.py_model_inputs_, attn_pyobj);
+        try {
+            py_forward_method_(capture_mem_hold_.py_model_inputs_, attn_pyobj);
+        } catch (const pybind11::error_already_set& e) {
+            RTP_LLM_LOG_ERROR("initCapture forward (output datatype) python exception: %s", e.what());
+            throw;
+        } catch (const std::exception& e) {
+            RTP_LLM_LOG_ERROR("initCapture forward (output datatype) std exception: %s", e.what());
+            throw;
+        }
         RTP_LLM_LOG_INFO("initCapture forward for output datatype end");
         output = torch::zeros({max_num_token_, hidden_size_}, options_cuda_float_);
         capture_mem_hold_.setHiddenStates(output);
@@ -645,9 +654,31 @@ void CudaGraphRunner::initCapture() {
         logCudaGraphPoolMemory("before_capture");
 
         if (is_prefill_cuda_graph_mode_) {
-            RTP_LLM_CHECK_WITH_INFO(
-                isEmbeddingStylePrefillCudaGraph() || isMtpDraftPrefillCudaGraph(),
-                "prefill cuda graph: expected embedding-style or MTP draft layout");
+            RTP_LLM_LOG_INFO("initCapture forward post check start for prefill");
+            capture_mem_hold_.py_model_inputs_.attention_inputs.cu_seqlens.data_ptr<int>()[1]    = max_num_token_;
+            capture_mem_hold_.py_model_inputs_.attention_inputs.cu_kv_seqlens.data_ptr<int>()[1] = max_num_token_;
+            capture_mem_hold_.py_model_inputs_.attention_inputs.input_lengths.data_ptr<int>()[0] = max_num_token_;
+            PyModelInputs inputs = capture_mem_hold_.py_model_inputs_;
+            inputs.attention_inputs.cu_seqlens =
+                capture_mem_hold_.py_model_inputs_.attention_inputs.cu_seqlens.slice(0, 0, 2);
+            inputs.attention_inputs.cu_kv_seqlens =
+                capture_mem_hold_.py_model_inputs_.attention_inputs.cu_kv_seqlens.slice(0, 0, 2);
+            inputs.attention_inputs.input_lengths =
+                capture_mem_hold_.py_model_inputs_.attention_inputs.input_lengths.slice(0, 0, 1);
+            if (capture_mem_hold_.py_model_inputs_.attention_inputs.prefix_lengths.defined()) {
+                inputs.attention_inputs.prefix_lengths =
+                    capture_mem_hold_.py_model_inputs_.attention_inputs.prefix_lengths.slice(0, 0, 1);
+            }
+            if (capture_mem_hold_.py_model_inputs_.attention_inputs.prefix_lengths_d.defined()) {
+                inputs.attention_inputs.prefix_lengths_d =
+                    capture_mem_hold_.py_model_inputs_.attention_inputs.prefix_lengths_d.slice(0, 0, 1);
+            }
+            inputs.attention_inputs.kv_cache_kernel_block_id_device =
+                capture_mem_hold_.py_model_inputs_.attention_inputs.kv_cache_kernel_block_id_device.slice(0, 0, 1);
+            inputs.attention_inputs.kv_cache_kernel_block_id_host =
+                capture_mem_hold_.py_model_inputs_.attention_inputs.kv_cache_kernel_block_id_host.slice(0, 0, 1);
+            py_forward_method_(inputs);
+            RTP_LLM_LOG_INFO("initCapture forward post check end for prefill");
             capturePrefill();
         } else {
             captureDecode();
@@ -700,12 +731,27 @@ void CudaGraphRunner::captureOneGraphInstance(int key, const char* key_type) {
         {
             cuda_graph::graphCaptureBegin(graph, shared_graph_pool_);
             cuda_graph::GraphNcclCaptureContext capture_ctx;
-            CudaGraphCaptureGuard capture_guard(&capture_ctx);
+            CudaGraphCaptureGuard               capture_guard(&capture_ctx);
             try {
                 auto py_outputs_obj = py_forward_method_(inputs, attn_pyobj);
                 outputs             = py_outputs_obj.cast<PyModelOutputs>();
             } catch (const py::error_already_set& e) {
                 RTP_LLM_LOG_ERROR("Capture forward failed for %s %d: %s", key_type, key, e.what());
+                // Format the python traceback so the actual offending Python
+                // call site is visible (otherwise pybind only surfaces the
+                // top-level error message, which for cudaErrorStreamCapture-
+                // Unsupported is unhelpful).
+                try {
+                    py::object  tb_mod    = py::module::import("traceback");
+                    py::object  trace_str = tb_mod.attr("format_exception")(e.type(), e.value(), e.trace());
+                    std::string full_tb;
+                    for (auto item : trace_str) {
+                        full_tb += py::str(item).cast<std::string>();
+                    }
+                    RTP_LLM_LOG_ERROR("Capture forward python traceback:\n%s", full_tb.c_str());
+                } catch (...) {
+                    RTP_LLM_LOG_ERROR("Capture forward: failed to format python traceback");
+                }
                 throw;
             }
             graph_instances_[key].mem_hold_.decoder_layer_hidden_states_.copy_(outputs.hidden_states);
