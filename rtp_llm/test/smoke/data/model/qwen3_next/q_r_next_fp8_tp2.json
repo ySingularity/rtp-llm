@@ -8,7 +8,7 @@
                 "messages": [
                     {
                         "role": "user",
-                        "content": "$prompt:s2"
+                        "content": "你是谁"
                     }
                 ],
                 "max_tokens": 100,
@@ -17,30 +17,71 @@
                 "top_k": 1
             },
             "result": {
+                "id": "chat-",
+                "object": "chat.completion",
+                "created": 1777215026,
+                "model": "",
                 "choices": [
                     {
                         "index": 0,
                         "message": {
                             "role": "assistant",
-                            "content": "Here's a thinking process that leads to the suggested questions about English listening methods:\n\n1.  **Analyze the Request:**\n    *   **Topic:** English Listening Methods (英语听力方法).\n    *   **Task:** Propose several questions (提出几个问题).\n    *   **Language:** The user asked in Chinese, so the output should be in Chinese (with English terms where appropriate for clarity).\n    *   **Goal:** The questions should be thought-prov",
-                            "partial": false
+                            "content": "嗯，用户问“你是谁”，这是一个很基础的问题。我需要先确认自己的身份。我是 Qwen3.5，阿里巴巴最新推出的通义千问大语言模型。我应该简明扼要地介绍自己，同时突出关键升级点，但避免过于技术化的术语。\n\n用户可能想了解我的能力，所以需要提到主要功能，比如多语言支持、逻辑推理、代码生成等。但要注意不要罗列太多细节，保持回答简洁。另外，用户可能没有明确说明使用",
+                            "reasoning_content": null,
+                            "function_call": null,
+                            "tool_calls": null,
+                            "partial": false,
+                            "tool_call_id": null
                         },
-                        "finish_reason": "length"
+                        "finish_reason": "length",
+                        "logprobs": null
                     }
                 ],
                 "usage": {
-                    "prompt_tokens": 18,
-                    "total_tokens": 118,
-                    "completion_tokens": 100
-                }
+                    "prompt_tokens": 11,
+                    "total_tokens": 111,
+                    "completion_tokens": 100,
+                    "completion_tokens_details": null,
+                    "prompt_tokens_details": null
+                },
+                "debug_info": null,
+                "aux_info": {
+                    "cost_time": 7956.635,
+                    "iter_count": 100,
+                    "prefix_len": 0,
+                    "input_len": 11,
+                    "output_len": 100,
+                    "step_output_len": 100,
+                    "first_token_cost_time": 204.246,
+                    "wait_time": 0.0,
+                    "pd_sep": false,
+                    "cum_log_probs": [],
+                    "beam_responses": [],
+                    "softmax_probs": [],
+                    "reuse_len": 0,
+                    "local_reuse_len": 0,
+                    "remote_reuse_len": 0,
+                    "memory_reuse_len": 0,
+                    "prefill_total_reuse_len": 0,
+                    "prefill_local_reuse_len": 0,
+                    "prefill_remote_reuse_len": 0,
+                    "prefill_memory_reuse_len": 0,
+                    "decode_total_reuse_len": 0,
+                    "decode_local_reuse_len": 0,
+                    "decode_remote_reuse_len": 0,
+                    "decode_memory_reuse_len": 0,
+                    "role_addrs": [],
+                    "aux_string": ""
+                },
+                "extra_outputs": null
             }
         },
         {
             "query": {
                 "prompt_batch": [
-                    "$prompt:s1",
-                    "$prompt:s1",
-                    "$prompt:s1"
+                    "hello, what is your name?",
+                    "hello, what is your name?",
+                    "hello, what is your name?"
                 ],
                 "generate_config": {
                     "max_new_tokens": 10,
@@ -50,13 +91,100 @@
             "result": {
                 "response_batch": [
                     {
-                        "response": "\n\nThe CAP theorem, also known as Brewer's"
+                        "response": "\n\n<think>\nThinking Process:\n\n1. ",
+                        "response_alternatives": null,
+                        "hidden_states": null,
+                        "logits": null,
+                        "loss": null,
+                        "input_ids": null,
+                        "output_ids": null,
+                        "aux_info": {
+                            "input_len": 7,
+                            "prefix_len": 0,
+                            "reuse_len": 0,
+                            "local_reuse_len": 0,
+                            "remote_reuse_len": 0,
+                            "memory_reuse_len": 0,
+                            "prefill_total_reuse_len": 0,
+                            "prefill_local_reuse_len": 0,
+                            "prefill_remote_reuse_len": 0,
+                            "prefill_memory_reuse_len": 0,
+                            "decode_total_reuse_len": 0,
+                            "decode_local_reuse_len": 0,
+                            "decode_remote_reuse_len": 0,
+                            "decode_memory_reuse_len": 0,
+                            "output_len": 10,
+                            "step_output_len": 10,
+                            "iter_count": 10,
+                            "cum_log_probs": [],
+                            "beam_responses": [],
+                            "pd_sep": false,
+                            "softmax_probs": []
+                        }
                     },
                     {
-                        "response": "\n\nThe CAP theorem, also known as Brewer's"
+                        "response": "\n\n<think>\nThinking Process:\n\n1. ",
+                        "response_alternatives": null,
+                        "hidden_states": null,
+                        "logits": null,
+                        "loss": null,
+                        "input_ids": null,
+                        "output_ids": null,
+                        "aux_info": {
+                            "input_len": 7,
+                            "prefix_len": 0,
+                            "reuse_len": 0,
+                            "local_reuse_len": 0,
+                            "remote_reuse_len": 0,
+                            "memory_reuse_len": 0,
+                            "prefill_total_reuse_len": 0,
+                            "prefill_local_reuse_len": 0,
+                            "prefill_remote_reuse_len": 0,
+                            "prefill_memory_reuse_len": 0,
+                            "decode_total_reuse_len": 0,
+                            "decode_local_reuse_len": 0,
+                            "decode_remote_reuse_len": 0,
+                            "decode_memory_reuse_len": 0,
+                            "output_len": 10,
+                            "step_output_len": 10,
+                            "iter_count": 10,
+                            "cum_log_probs": [],
+                            "beam_responses": [],
+                            "pd_sep": false,
+                            "softmax_probs": []
+                        }
                     },
                     {
-                        "response": "\n\nThe CAP theorem, also known as Brewer's"
+                        "response": "\n\n<think>\nThinking Process:\n\n1. ",
+                        "response_alternatives": null,
+                        "hidden_states": null,
+                        "logits": null,
+                        "loss": null,
+                        "input_ids": null,
+                        "output_ids": null,
+                        "aux_info": {
+                            "input_len": 7,
+                            "prefix_len": 0,
+                            "reuse_len": 0,
+                            "local_reuse_len": 0,
+                            "remote_reuse_len": 0,
+                            "memory_reuse_len": 0,
+                            "prefill_total_reuse_len": 0,
+                            "prefill_local_reuse_len": 0,
+                            "prefill_remote_reuse_len": 0,
+                            "prefill_memory_reuse_len": 0,
+                            "decode_total_reuse_len": 0,
+                            "decode_local_reuse_len": 0,
+                            "decode_remote_reuse_len": 0,
+                            "decode_memory_reuse_len": 0,
+                            "output_len": 10,
+                            "step_output_len": 10,
+                            "iter_count": 10,
+                            "cum_log_probs": [],
+                            "beam_responses": [],
+                            "pd_sep": false,
+                            "softmax_probs": []
+                        }
                     }
                 ]
             }
