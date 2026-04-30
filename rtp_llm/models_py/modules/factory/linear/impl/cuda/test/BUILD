@@ -7,8 +7,8 @@ py_test_deps = [
 ]
 
 py_test(
-    name = "fp8_deepgemm_linear_test",
-    srcs = ["fp8_deepgemm_linear_test.py"],
+    name = "fp8_linear_test",
+    srcs = ["fp8_linear_test.py"],
     deps = py_test_deps,
     env = test_envs,
     tags = ["H20"],
@@ -19,7 +19,7 @@ py_test(
     name = "fp8_deepgemm_linear_sm100_test",
     srcs = [
         "fp8_deepgemm_linear_sm100_test.py",
-        "fp8_deepgemm_linear_test.py"
+        "fp8_linear_test.py"
     ],
     deps = py_test_deps,
     env = test_envs,
@@ -31,7 +31,7 @@ py_test(
     name = "fp8_deepgemm_linear_sm100_arm_test",
     srcs = [
         "fp8_deepgemm_linear_sm100_arm_test.py",
-        "fp8_deepgemm_linear_test.py"
+        "fp8_linear_test.py"
     ],
     deps = py_test_deps,
     env = test_envs,
@@ -47,4 +47,3 @@ py_test(
     tags = ["SM100_ARM"],
     exec_properties = {'gpu':'SM100_ARM'},
 )
-
