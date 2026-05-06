@@ -9,9 +9,14 @@ It extends :class:`PureTpRouterFp8PerBlock` by following the sglang
 1. Gather tokens only across the DP group (ranks that share ``tp_rank``);
    TP siblings already hold the same input batch, so including them would
    duplicate work.
-2. Pad locally to ``max(local_n across DP)`` before all_gather so the
-   collective works on a uniform shape. Padding rows use ``topk_ids = -1``
-   which the Triton kernel's ``filter_expert`` path treats as no-op.
+2. Pad locally to a **fixed** ``_dp_max_tokens_per_rank`` (computed at init
+   from ``ll_num_max_token`` and ``max_seq_len``) before all_gather, so the
+   collective shape is constant regardless of the current batch size or
+   prefill/decode phase. Padding rows use ``topk_ids = -1`` which the
+   Triton kernel's ``filter_expert`` path treats as no-op. This is the
+   same mechanism DeepEP low-latency uses
+   (``num_max_dispatch_tokens_per_rank``): fixed shapes are the cornerstone
+   of CUDA-graph compatibility across mixed phases on different DP ranks.
 3. Run the local PureTp filter trick (each rank processes only its 1/ep
    experts' share of every token).
 4. All-reduce outputs across the world group (``Group.DP_AND_TP``) — this
@@ -19,12 +24,13 @@ It extends :class:`PureTpRouterFp8PerBlock` by following the sglang
    TP reduction in one shot.
 5. Slice back to this rank's DP shard using ``dp_rank * max_size``.
 
-CUDA graph caveat: a captured graph embeds all_gather with a fixed shape. In
-mixed TP+DP, different DP ranks may do different phases (prefill vs decode)
-with different ``local_n``, so the captured graphs don't line up. Enable
-this router only for eager execution (``--enable_cuda_graph 0``) or make
-sure the engine pads every DP rank to the same shape per step.
+CUDA graph: because all collective shapes are constant, a captured decode
+graph on one rank can safely run concurrently with an eager prefill on
+another DP rank — the NCCL shape protocol matches regardless. If a real
+batch ever exceeds ``_dp_max_tokens_per_rank``, the ``prepare()`` asserts
+rather than silently mis-shaping the collective.
 """
+import os
 from typing import Any, Optional, Tuple
 
 import torch
@@ -84,6 +90,23 @@ class PureTpRouterFp8PerBlockTritonDpTp(PureTpRouterFp8PerBlock):
         super().__init__(config, quant_config)
         self.dp_size = config.dp_size
         self.dp_rank = config.dp_rank
+        # Fixed max-tokens-per-DP-rank sizing. Mirrors DeepEP LL's
+        # ``num_max_dispatch_tokens_per_rank``: a constant buffer depth that
+        # makes every collective shape a compile-time constant, so captured
+        # CUDA graphs on one rank interop correctly with eager forwards on
+        # another rank (e.g. decode-replay on rank 0 while rank 2 does eager
+        # prefill). ``ll_num_max_token`` = ``concurrency_limit * (sp_gen+1)``
+        # bounds decode; prefill can still carry up to ~max_seq_len tokens
+        # per request, so we lift the floor to 128 — enough for typical
+        # short prompts on TP+DP test configs without ballooning per-step
+        # compute. If your prompts exceed this floor, set a larger
+        # concurrency_limit or override via MOE_DP_MAX_TOKENS_PER_RANK.
+        base = max(int(config.ll_num_max_token or 0), 128)
+        override = os.environ.get("MOE_DP_MAX_TOKENS_PER_RANK")
+        if override:
+            base = max(base, int(override))
+        # Round up to multiple of 8 for tile alignment on the Triton kernel.
+        self._dp_max_tokens_per_rank = ((base + 7) // 8) * 8
         # State carried from prepare() to finalize().
         self._dp_local_num_tokens: Optional[int] = None
         self._dp_padded_size: Optional[int] = None
@@ -107,23 +130,21 @@ class PureTpRouterFp8PerBlockTritonDpTp(PureTpRouterFp8PerBlock):
         ``Group.DP`` resolves to the world group, so behavior matches the
         pure-DP path; in mixed TP+DP it gathers only dp_size payloads.
 
-        Each rank pads its tensors to ``max(local_n across DP)`` so the
-        collective gets a uniform shape. Padding rows carry
-        ``topk_ids = -1``; the triton kernel's ``filter_expert`` path treats
-        these as no-op.
+        Each rank pads its tensors to the fixed ``_dp_max_tokens_per_rank``
+        (not runtime max). This keeps the collective shape constant across
+        batches and phases — the same property DeepEP low-latency relies on
+        for CUDA-graph friendliness. Padding rows carry ``topk_ids = -1``;
+        the Triton kernel's ``filter_expert`` path treats these as no-op.
         """
         local_n = a1.size(0)
-        if torch.cuda.is_current_stream_capturing():
-            # During capture we cannot GPU->CPU sync for max(). Assume the
-            # engine keeps DP shards balanced at fixed decode batch sizes
-            # listed in decode_capture_config. If this assumption fails at
-            # replay time, the collective shapes will mismatch and NCCL
-            # will hang.
-            padded = local_n
-        else:
-            local_size = torch.tensor([local_n], device=a1.device, dtype=torch.long)
-            sizes = all_gather(local_size, group=Group.DP)
-            padded = int(sizes.max().item())
+        padded = self._dp_max_tokens_per_rank
+        # Fail loudly rather than silently overflowing into a smaller buffer.
+        assert local_n <= padded, (
+            f"TP+DP triton router: local_n={local_n} exceeds fixed "
+            f"_dp_max_tokens_per_rank={padded}. Raise MOE_DP_MAX_TOKENS_PER_RANK "
+            f"or increase concurrency_limit (current ll_num_max_token="
+            f"{self.config.ll_num_max_token})."
+        )
 
         if padded != local_n:
             pad_n = padded - local_n
