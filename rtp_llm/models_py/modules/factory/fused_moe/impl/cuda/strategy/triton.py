@@ -89,6 +89,12 @@ class CudaTritonFp8PerBlockStrategy(MoeStrategy):
     routing + Triton fused_moe_kernel + (small-token torch.compile reduce or
     moe_sum_reduce). Use this when DeepGEMM is unavailable or when the
     cuda-graph-friendly Triton path is preferred for decode shapes.
+
+    Covers single-GPU / pure-TP / pure-DP topologies via
+    :class:`PureTpRouterFp8PerBlockTriton`. Mixed TP+DP is handled by
+    :class:`CudaTritonFp8PerBlockDpTpStrategy` which shares the same
+    ``moe_strategy`` name; the two strategies are mutually exclusive via
+    their router's ``check_conditions``.
     """
 
     @classmethod
@@ -108,6 +114,47 @@ class CudaTritonFp8PerBlockStrategy(MoeStrategy):
 
         return StrategyAttributes(
             router_class=PureTpRouterFp8PerBlockTriton,
+            executor_class=TritonFusedMoeExecutor,
+            quant_config=FusedMoEQuantConfig(
+                quant_dtype=torch.float8_e4m3fn,
+                block_shape=[128, 128],
+            ),
+        )
+
+
+class CudaTritonFp8PerBlockDpTpStrategy(MoeStrategy):
+    """FP8 per-block (128x128) Triton fused MoE for DP+TP mixed topology.
+
+    Pairs the Triton fused MoE executor with
+    :class:`PureTpRouterFp8PerBlockTritonDpTp`, which follows the sglang
+    ``StandardDispatcher`` pattern: gather across the DP group (ranks sharing
+    ``tp_rank``, avoiding TP-sibling duplication), filter+run Triton kernel
+    locally, then world-group all_reduce and slice back to the local DP
+    shard.
+
+    Gated by both the ``triton_fp8_per_block`` ``moe_strategy`` name (so it
+    coexists with :class:`CudaTritonFp8PerBlockStrategy`) and by the
+    DP-enabled topology check inside the router — the two strategies never
+    match the same config simultaneously.
+    """
+
+    @classmethod
+    def check_conditions(cls, checker: Any, config: MoEConfigAdapter) -> None:
+        resolver = MoeConfigResolver()
+        quant_method = resolver.get_quant_method(config)
+        checker.check(quant_method == "FP8_PER_BLOCK")
+        checker.check(config.moe_strategy == "triton_fp8_per_block")
+
+    def get_attributes(self) -> StrategyAttributes:
+        from rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.executors.triton_fused_moe_executor import (
+            TritonFusedMoeExecutor,
+        )
+        from rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.routers.pure_tp_router_dp_tp import (
+            PureTpRouterFp8PerBlockTritonDpTp,
+        )
+
+        return StrategyAttributes(
+            router_class=PureTpRouterFp8PerBlockTritonDpTp,
             executor_class=TritonFusedMoeExecutor,
             quant_config=FusedMoEQuantConfig(
                 quant_dtype=torch.float8_e4m3fn,

@@ -228,6 +228,9 @@ class PureTpRouterFp8PerBlockTriton(PureTpRouterFp8PerBlock):
     ``ep_size==dp_size``. In that case it all-gathers tokens across the EP
     group before running the local PureTp filter trick, and all-reduces the
     output back across the same group, then slices to the local DP shard.
+
+    For mixed TP+DP+EP (``tp_size>1, dp_size>1``), see
+    :class:`PureTpRouterFp8PerBlockTritonDpTp`.
     """
 
     @classmethod
@@ -264,7 +267,7 @@ class PureTpRouterFp8PerBlockTriton(PureTpRouterFp8PerBlock):
         self._needs_dp_gather = (
             self.dp_size > 1 and self.tp_size == 1 and self.ep_size == self.dp_size
         )
-        # State carried from prepare() to finalize() for the DP+EP path.
+        # State carried from prepare() to finalize() for the DP path.
         self._dp_local_num_tokens: Optional[int] = None
         self._dp_padded_size: Optional[int] = None
 
