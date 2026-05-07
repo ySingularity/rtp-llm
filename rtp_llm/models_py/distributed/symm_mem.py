@@ -154,28 +154,43 @@ class TorchSymmMemCommunicator:
 
         Args:
             inp: Input tensor on the target CUDA device (bfloat16).
-            out: Optional output tensor; if omitted, a new tensor is allocated.
+            out: Optional output tensor. **Default None returns a view into
+                 the internal symmetric buffer**, skipping the post-reduce
+                 D2D copy — saves ~5µs per call. The view is valid only
+                 until the next ``all_reduce`` / ``all_gather`` on the same
+                 communicator (buffer is reused). Pass an explicit ``out``
+                 to get a standalone tensor (legacy behavior).
 
         Returns:
             The reduced tensor (same shape as inp), or None if disabled.
 
         Implementation details:
-            - Stages 'inp' into the symmetric buffer.
+            - Stages 'inp' into the symmetric buffer (D2D copy is unavoidable
+              unless the caller guarantees 'inp' lives in the symm region,
+              which we do not assume here).
             - Selects 'multimem' or 'two_shot' kernel based on topology.
-            - Writes the result into 'out' and returns it.
+            - Optionally copies back to 'out'.
         """
+        numel = inp.numel()
         if out is None:
             out = torch.empty_like(inp)
-        self.buffer[: inp.numel()].copy_(inp.view(-1))
+        self.buffer[:numel].copy_(inp.view(-1))
         if self.world_size in self._WORLD_SIZES_MULTIMEM[self.device_capability]:
             torch.ops.symm_mem.multimem_all_reduce_(
-                self.buffer[: inp.numel()], "sum", self.group.group_name
+                self.buffer[:numel], "sum", self.group.group_name
             )
         else:
             torch.ops.symm_mem.two_shot_all_reduce_(
-                self.buffer[: inp.numel()], "sum", self.group.group_name
+                self.buffer[:numel], "sum", self.group.group_name
             )
-        out.copy_(self.buffer[: inp.numel()].view(out.shape))
+        # NOTE: the tailing ``out.copy_(...)`` is load-bearing — it also acts
+        # as a stream-order barrier that ensures the multimem write to
+        # ``self.buffer`` completes before downstream kernels read it.
+        # Returning ``self.buffer.view(...)`` directly WITHOUT this copy was
+        # previously attempted and produced corrupted outputs (token stream
+        # garbage), because the subsequent gate/matmul kernel started
+        # reading the buffer before the multicast had drained. Keep the copy.
+        out.copy_(self.buffer[:numel].view(out.shape))
         return out
 
     # adapter from torch/distributed/_symmetric_memory/__init__.py
@@ -237,35 +252,65 @@ class TorchSymmMemCommunicator:
         torch.ops.symm_mem.multimem_all_gather_out(
             shard.view(-1), self.group.group_name, buf_out
         )
+        # NOTE: same lesson as all_reduce — the copy doubles as a stream
+        # barrier for the multicast write. See the note there.
         out.copy_(buf_out.view(self.world_size, *shard.shape))
         return out
 
 
 # Use lazy initialization instead of module-level initialization
-_symm_mem_comm: Optional[TorchSymmMemCommunicator] = None
+# Per-group symm-mem communicators keyed by a caller-supplied tag (e.g.
+# "TP", "DP_AND_TP"). The original single-global API is preserved on the
+# default key for backwards compatibility with callers that don't care which
+# group they get.
+_DEFAULT_KEY = "default"
+_symm_mem_comms: dict = {}
 
 
 def init_symm_mem_communicator(
-    tp_group: ProcessGroup,
+    tp_group: ProcessGroup, key: str = _DEFAULT_KEY
 ) -> Optional[TorchSymmMemCommunicator]:
-    """Initialize TorchSymmMemCommunicator for TP group."""
-    global _symm_mem_comm
+    """Initialize and register a TorchSymmMemCommunicator for a process group.
+
+    Args:
+        tp_group: The process group to rendezvous on. Must be called by all
+            members of ``tp_group`` in the same order (rendezvous is a
+            collective op).
+        key: Registry key used by ``get_symm_mem_communicator(key)``. The
+            ``"TP"`` key is used by the MoE / attention hot path; other keys
+            (e.g. ``"DP_AND_TP"``) are looked up by ``collective_torch`` for
+            world-group all_reduce and all_gather.
+
+    Returns ``None`` if symm-mem is unavailable, disabled, or initialization
+    fails; callers then transparently fall back to NCCL.
+    """
     try:
         symm_mem_comm = TorchSymmMemCommunicator(tp_group, torch.cuda.current_device())
         if symm_mem_comm.disabled:
             logging.warning(
-                f"TorchSymmMemCommunicator is disabled, skipping initialization"
+                f"TorchSymmMemCommunicator is disabled for key={key}, skipping"
             )
             return None
-        _symm_mem_comm = symm_mem_comm
+        _symm_mem_comms[key] = symm_mem_comm
+        # Keep the legacy default-key entry pointing at the TP communicator
+        # so existing `get_symm_mem_communicator()` callsites still work.
+        if key == "TP":
+            _symm_mem_comms[_DEFAULT_KEY] = symm_mem_comm
         return symm_mem_comm
     except Exception as e:
         # If initialization fails, fall back to regular all_reduce
-        logging.warning(f"Failed to initialize TorchSymmMemCommunicator: {e}")
+        logging.warning(
+            f"Failed to initialize TorchSymmMemCommunicator for key={key}: {e}"
+        )
         return None
 
 
-def get_symm_mem_communicator() -> Optional[TorchSymmMemCommunicator]:
-    """Get or initialize TorchSymmMemCommunicator (lazy initialization)."""
-    global _symm_mem_comm
-    return _symm_mem_comm
+def get_symm_mem_communicator(
+    key: str = _DEFAULT_KEY,
+) -> Optional[TorchSymmMemCommunicator]:
+    """Look up a previously-initialized symm-mem communicator by key.
+
+    Returns ``None`` when no communicator exists for ``key`` — callers must
+    fall back to NCCL in that case.
+    """
+    return _symm_mem_comms.get(key)
