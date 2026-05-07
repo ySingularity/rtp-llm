@@ -87,9 +87,107 @@ class TritonFusedMoeExecutor(FusedMoeExpertExecutor):
         # after PureTpRouter recompute).
         self.filter_expert = self.num_local_experts != self.num_experts
 
+        # Persistent intermediate buffer pool. Replaces per-call
+        # ``torch.zeros`` for cache1/2/3 + ``torch.empty`` for the output —
+        # one allocation, one zero-fill kernel per MoE forward instead of
+        # four. Lazily sized on first call (during eager warmup, before
+        # CUDA graph capture). The buffer is held by the executor so it
+        # stays alive across graph capture/replay.
+        self._buf_pool: Optional[torch.Tensor] = None
+        self._buf_pool_capacity: int = 0
+        self._buf_offsets: Optional[tuple] = None
+
+        # Persistent scratch buffers for ``moe_align_block_size`` internals.
+        # Replaces the per-call ``torch.empty`` / ``torch.zeros`` /
+        # ``torch.full`` chain (~12 element-wise ops) with in-place
+        # ``zero_()`` / ``fill_()`` on cached tensors. Sized for the
+        # worst-case (num_valid_tokens, max_pad) seen during warmup.
+        self._align_scratch: Optional[Dict[str, torch.Tensor]] = None
+        self._align_scratch_capacity: tuple = (0, 0)  # (num_valid_tokens, max_pad)
+
     @property
     def topk_ids_dtype(self) -> torch.dtype:
         return torch.int32
+
+    def _ensure_align_scratch(
+        self,
+        num_valid_tokens: int,
+        block_size: int,
+        device: torch.device,
+    ) -> Dict[str, torch.Tensor]:
+        """Pre-allocate scratch buffers for moe_align_block_size.
+
+        The ``num_experts`` here is the *physical* expert count seen by the
+        Triton kernel (== ``self.num_experts`` for non-EP, or full E even
+        when EP-filtered, since ``moe_align`` operates on global topk_ids
+        before filtering). ``max_pad`` is computed identically to the
+        in-function formula so the scratch fits worst-case bounds.
+        """
+        max_pad = num_valid_tokens + self.num_experts * block_size
+        max_pad = ((max_pad + block_size - 1) // block_size) * block_size
+        max_num_blocks = max_pad // block_size
+        cap_n, cap_p = self._align_scratch_capacity
+        if self._align_scratch is None or cap_n < num_valid_tokens or cap_p < max_pad:
+            self._align_scratch = {
+                "bucket": torch.empty(
+                    num_valid_tokens, dtype=torch.int64, device=device
+                ),
+                "expert_count": torch.empty(
+                    self.num_experts + 1, dtype=torch.int64, device=device
+                ),
+                "cum": torch.empty(
+                    self.num_experts + 1, dtype=torch.int64, device=device
+                ),
+                "slot_counter": torch.empty(
+                    self.num_experts, dtype=torch.int32, device=device
+                ),
+                "sorted_ids": torch.empty(max_pad, dtype=torch.int32, device=device),
+                "expert_ids": torch.empty(
+                    max_num_blocks, dtype=torch.int32, device=device
+                ),
+            }
+            self._align_scratch_capacity = (num_valid_tokens, max_pad)
+        return self._align_scratch
+
+    def _ensure_buffers(
+        self,
+        num_tokens: int,
+        topk: int,
+        N: int,
+        hidden: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> "tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]":
+        """Get pre-allocated cache1/cache2/cache3/out views from the pool.
+
+        On first call (or when the requested ``num_tokens`` exceeds the
+        current capacity) the pool is grown — this only happens during
+        eager warmup, never during a captured CUDA graph since
+        ``num_tokens`` is constant in external-DP-gather mode.
+        """
+        size_c1 = num_tokens * topk * N
+        size_c2 = num_tokens * topk * (N // 2)
+        size_c3 = num_tokens * topk * hidden
+        size_out = num_tokens * hidden
+        # Cache region (must be zeroed for filtered-row correctness) +
+        # output region (overwritten by sum-reduce, no zero needed).
+        cache_total = size_c1 + size_c2 + size_c3
+        total = cache_total + size_out
+
+        if self._buf_pool is None or self._buf_pool_capacity < total:
+            self._buf_pool = torch.empty(total, dtype=dtype, device=device)
+            self._buf_pool_capacity = total
+
+        # One kernel zeroes cache1+cache2+cache3 in a contiguous span,
+        # replacing three torch.zeros allocations.
+        self._buf_pool[:cache_total].zero_()
+
+        b = self._buf_pool
+        c1 = b[:size_c1].view(num_tokens * topk, N)
+        c2 = b[size_c1 : size_c1 + size_c2].view(num_tokens * topk, N // 2)
+        c3 = b[size_c1 + size_c2 : cache_total].view(num_tokens, topk, hidden)
+        out = b[cache_total : cache_total + size_out].view(num_tokens, hidden)
+        return c1, c2, c3, out
 
     def execute(
         self,
@@ -131,6 +229,47 @@ class TritonFusedMoeExecutor(FusedMoeExpertExecutor):
         # storage dtype of ``hidden_states`` after a router pre-quant.
         out_dtype = payload.expert_x_origin_dtype or hidden_states.dtype
 
+        # Pre-allocate / reuse intermediate buffers from this executor's pool.
+        effective_dtype = (
+            torch.bfloat16 if out_dtype == torch.float8_e4m3fn else out_dtype
+        )
+        num_tokens = hidden_states.shape[0]
+        N = self.w13_weight.shape[1]
+        hidden = self.w2_weight.shape[1]
+        c1, c2, c3, out_buf = self._ensure_buffers(
+            num_tokens=num_tokens,
+            topk=topk_ids.shape[1],
+            N=N,
+            hidden=hidden,
+            dtype=effective_dtype,
+            device=hidden_states.device,
+        )
+        # moe_align scratch: sized for num_valid_tokens = num_tokens × topk
+        # at the worst case. block_size is read from the same try_get_optimal
+        # config that fused_experts_impl uses, so values agree.
+        from rtp_llm.models_py.triton_kernels.moe.fused_moe_triton_config import (
+            get_config_dtype_str,
+            try_get_optimal_moe_config,
+        )
+
+        align_cfg = try_get_optimal_moe_config(
+            self.w13_weight.shape,
+            (
+                self.w2_weight.shape[0],
+                self.w2_weight.shape[1],
+                self.w2_weight.shape[2],
+            ),
+            topk_ids.shape[1],
+            get_config_dtype_str(use_fp8_w8a8=self.use_fp8_w8a8, dtype=effective_dtype),
+            num_tokens,
+            block_shape=self.block_shape,
+        )
+        align_scratch = self._ensure_align_scratch(
+            num_valid_tokens=num_tokens * topk_ids.shape[1],
+            block_size=align_cfg["BLOCK_SIZE_M"],
+            device=hidden_states.device,
+        )
+
         out = fused_experts_impl(
             hidden_states=hidden_states.contiguous(),
             w1=self.w13_weight,
@@ -149,5 +288,10 @@ class TritonFusedMoeExecutor(FusedMoeExpertExecutor):
             block_shape=self.block_shape,
             filter_expert=self.filter_expert,
             out_dtype=out_dtype,
+            intermediate_cache1=c1,
+            intermediate_cache2=c2,
+            intermediate_cache3=c3,
+            out_hidden_states=out_buf,
+            align_scratch=align_scratch,
         )
         return CombineForwardPayload(fused_expert_output=out)

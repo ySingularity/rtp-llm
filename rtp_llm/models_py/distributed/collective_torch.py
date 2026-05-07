@@ -173,6 +173,11 @@ def _create_process_groups(
                     logging.info(
                         f"[rank: {world_rank}] Stored DP group with key: {group_key} {dp_group} with ranks: {dp_ranks}"
                     )
+                    # Fast path for `all_gather(Group.DP)` / `all_reduce(Group.DP)`.
+                    # Only the members of this DP group rendezvous on its
+                    # symm-mem buffer; other DP groups init separately via
+                    # their own iterations of the outer loop.
+                    init_symm_mem_communicator(dp_group, key=Group.DP.name)
                 # All ranks must wait for group creation to complete
                 torch.distributed.barrier()
 
@@ -199,13 +204,22 @@ def _create_process_groups(
                         f"[rank: {world_rank}] Stored TP group with key: {group_key} {tp_group} with ranks: {tp_ranks}"
                     )
 
-                init_symm_mem_communicator(tp_group)
+                init_symm_mem_communicator(tp_group, key="TP")
 
                 # All ranks must wait for group creation to complete
                 torch.distributed.barrier()
     elif tp_size > 1 and world_size == tp_size:
         # Single TP group: WORLD is the TP group, init symm_mem for it
-        init_symm_mem_communicator(torch.distributed.group.WORLD)
+        init_symm_mem_communicator(torch.distributed.group.WORLD, key="TP")
+
+    # Also register symm-mem for the world group so MoE finalize and DP
+    # entry-gather can use the fast two_shot / multimem path instead of
+    # falling back to NCCL RING. Skipped when WORLD == TP (already done
+    # above via the key="TP" init, which covers the same group).
+    if world_size > 1 and world_size != tp_size:
+        init_symm_mem_communicator(
+            torch.distributed.group.WORLD, key=Group.DP_AND_TP.name
+        )
 
 
 def _register_process_groups_to_cpp():
@@ -575,8 +589,13 @@ def all_reduce(tensor: torch.Tensor, group: Group) -> torch.Tensor:
     if rocm_rccl.should_use_capture_collectives(group == Group.TP):
         return rocm_rccl.capture_all_reduce(tensor, _get_group(group))
 
-    if group == Group.TP:
-        symm_mem_comm = get_symm_mem_communicator()
+    # Symm-mem fast path: two_shot / multimem kernels reach the NVLink
+    # hardware directly, avoiding the ~90µs NCCL RING setup/teardown per
+    # small collective. Available for any group registered at init time:
+    # TP, DP, and world (DP_AND_TP).
+    symm_key = group.name if group in (Group.TP, Group.DP, Group.DP_AND_TP) else None
+    if symm_key is not None:
+        symm_mem_comm = get_symm_mem_communicator(symm_key)
         if symm_mem_comm is not None and symm_mem_comm.should_torch_symm_mem_allreduce(
             tensor
         ):
@@ -605,8 +624,11 @@ def all_gather(tensor: torch.Tensor, group: Group) -> torch.Tensor:
         process_group = _get_group(group)
         return rocm_rccl.capture_all_gather(tensor, process_group)
 
-    if group == Group.TP:
-        symm_mem_comm = get_symm_mem_communicator()
+    # Symm-mem fast path via multimem_all_gather_out (requires SM 9+ NVLink
+    # multicast). Enabled for TP, DP, and world groups registered at init.
+    symm_key = group.name if group in (Group.TP, Group.DP, Group.DP_AND_TP) else None
+    if symm_key is not None:
+        symm_mem_comm = get_symm_mem_communicator(symm_key)
         if symm_mem_comm is not None and symm_mem_comm.should_torch_symm_mem_allgather(
             tensor
         ):

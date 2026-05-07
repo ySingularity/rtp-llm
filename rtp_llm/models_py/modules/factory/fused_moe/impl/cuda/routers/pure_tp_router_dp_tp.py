@@ -65,6 +65,18 @@ class PureTpRouterFp8PerBlockTritonDpTp(PureTpRouterFp8PerBlock):
     Produces row-major fp32 scales like
     :class:`PureTpRouterFp8PerBlockTriton` so the Triton
     ``invoke_fused_moe_kernel`` is happy.
+
+    External gather mode
+    --------------------
+    Setting ``use_external_dp_gather = True`` (via the ``MOE_EXTERNAL_DP_GATHER``
+    env, default on) tells the MoE layer (``GenericMoeLayer``) that it should
+    pre-gather DP-local tokens *before* running ``gate`` / ``topk`` and slice
+    back *after* ``finalize``. In that case this router skips its own
+    ``_gather_dp_inputs`` and slicing — it becomes a pure-TP (global-view)
+    router that only quantizes + filters its local expert shard. This mirrors
+    sglang's ``StandardDispatcher`` architecture and cuts per-MoE-layer
+    collectives from 3× all_gather(DP) + 1× all_reduce(world) down to
+    1× all_reduce(world) (gather) + 1× all_reduce(world) (combine).
     """
 
     @classmethod
@@ -107,6 +119,13 @@ class PureTpRouterFp8PerBlockTritonDpTp(PureTpRouterFp8PerBlock):
             base = max(base, int(override))
         # Round up to multiple of 8 for tile alignment on the Triton kernel.
         self._dp_max_tokens_per_rank = ((base + 7) // 8) * 8
+        # External-gather mode: let the MoE layer do gather/scatter and make
+        # this router act as a pure-TP (global-view) router. Default on; set
+        # MOE_EXTERNAL_DP_GATHER=0 to revert to the internal triple-gather
+        # path.
+        self.use_external_dp_gather = (
+            os.environ.get("MOE_EXTERNAL_DP_GATHER", "1") != "0"
+        )
         # State carried from prepare() to finalize().
         self._dp_local_num_tokens: Optional[int] = None
         self._dp_padded_size: Optional[int] = None
@@ -192,6 +211,11 @@ class PureTpRouterFp8PerBlockTritonDpTp(PureTpRouterFp8PerBlock):
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
     ) -> "ExpertForwardPayload":
+        if self.use_external_dp_gather:
+            # a1 is already the global [dp*padded, hidden] buffer gathered by
+            # GenericMoeLayer; topk_ids/topk_weights were computed on that
+            # global view. Just quant + local-expert filter.
+            return super().prepare(a1, a1_scale, a2_scale, topk_weights, topk_ids)
         self._dp_local_num_tokens = a1.size(0)
         a1, topk_ids, topk_weights, padded = self._gather_dp_inputs(
             a1, topk_ids, topk_weights
@@ -216,6 +240,10 @@ class PureTpRouterFp8PerBlockTritonDpTp(PureTpRouterFp8PerBlock):
         # different experts across DP groups).
         out = payload.fused_expert_output
         out = all_reduce(out, group=Group.DP_AND_TP)
+
+        if self.use_external_dp_gather:
+            # Layer will slice to the local DP shard.
+            return out
 
         # Slice back to this rank's own DP shard. The DP-group gather laid
         # payloads out in dp_rank order, so slot ``dp_rank * padded`` holds

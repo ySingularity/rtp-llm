@@ -72,6 +72,11 @@ def fused_experts_impl(
     filter_expert: bool = True,
     no_combine: bool = False,
     out_dtype: Optional[torch.dtype] = None,
+    intermediate_cache1: Optional[torch.Tensor] = None,
+    intermediate_cache2: Optional[torch.Tensor] = None,
+    intermediate_cache3: Optional[torch.Tensor] = None,
+    out_hidden_states: Optional[torch.Tensor] = None,
+    align_scratch: Optional[Dict[str, torch.Tensor]] = None,
 ) -> torch.Tensor:
     """Triton fused MoE forward.
 
@@ -109,47 +114,64 @@ def fused_experts_impl(
         block_shape=block_shape,
     )
 
+    # NOTE: persistent ``align_scratch`` is currently disabled — it caused
+    # garbage outputs in smoke tests, suspected scratch-buffer reallocation
+    # across CUDA graph captures invalidating previously-baked pointers. The
+    # fused 3-kernel moe_align path itself is correct (unit-tested bit-equal
+    # vs. legacy implementation); only the per-call scratch reuse is buggy.
+    # Leaving the codepath in place for future re-enablement once root-cause
+    # is fixed; for now we always allocate scratch fresh.
     sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
-        topk_ids, config["BLOCK_SIZE_M"], E
+        topk_ids, config["BLOCK_SIZE_M"], E, scratch=None
     )
 
+    # Output buffer (allocate if caller didn't supply one).
     if no_combine:
         assert not inplace
-        out_hidden_states = torch.empty(
-            (num_tokens, topk, w2.shape[1]),
-            device=hidden_states.device,
-            dtype=effective_dtype,
-        )
+        if out_hidden_states is None:
+            out_hidden_states = torch.empty(
+                (num_tokens, topk, w2.shape[1]),
+                device=hidden_states.device,
+                dtype=effective_dtype,
+            )
     elif inplace:
         out_hidden_states = hidden_states
-    else:
+    elif out_hidden_states is None:
         out_hidden_states = torch.empty(
             (num_tokens, w2.shape[1]),
             device=hidden_states.device,
             dtype=effective_dtype,
         )
 
-    # NOTE: must be ``zeros`` (not ``empty``). Rows belonging to filtered
-    # (-1 expert) tokens are never written by ``fused_moe_kernel`` /
+    # NOTE: must be zero-initialized (not just allocated). Rows belonging to
+    # filtered (-1 expert) tokens are never written by ``fused_moe_kernel`` /
     # ``act_and_mul_kernel`` (they early-return). The downstream
     # ``_quantize_input_fp8`` of ``intermediate_cache2`` reduces ``max(|row|)``
     # over those rows; uninitialized memory containing NaN/Inf would
     # propagate into the per-token scales and corrupt the second GEMM.
-    intermediate_cache1 = torch.zeros(
-        (num_tokens * topk, N),
-        device=hidden_states.device,
-        dtype=effective_dtype,
-    )
-    intermediate_cache2 = torch.zeros(
-        (num_tokens * topk, N // 2),
-        device=hidden_states.device,
-        dtype=effective_dtype,
-    )
-    intermediate_cache3 = torch.zeros(
-        (num_tokens, topk, w2.shape[1]),
-        device=hidden_states.device,
-        dtype=effective_dtype,
-    )
+    #
+    # When the caller supplies pre-allocated buffers (the executor route),
+    # they're guaranteed to come zeroed (executor's ``_ensure_buffers``
+    # zero-fills the whole pool in a single kernel). When the caller passes
+    # ``None``, we fall back to per-buffer ``torch.zeros``.
+    if intermediate_cache1 is None:
+        intermediate_cache1 = torch.zeros(
+            (num_tokens * topk, N),
+            device=hidden_states.device,
+            dtype=effective_dtype,
+        )
+    if intermediate_cache2 is None:
+        intermediate_cache2 = torch.zeros(
+            (num_tokens * topk, N // 2),
+            device=hidden_states.device,
+            dtype=effective_dtype,
+        )
+    if intermediate_cache3 is None:
+        intermediate_cache3 = torch.zeros(
+            (num_tokens, topk, w2.shape[1]),
+            device=hidden_states.device,
+            dtype=effective_dtype,
+        )
 
     if use_fp8_w8a8:
         assert w1_scale is not None
