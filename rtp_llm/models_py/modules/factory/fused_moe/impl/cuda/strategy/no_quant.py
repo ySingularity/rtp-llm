@@ -33,17 +33,32 @@ class CudaNoQuantEpLowLatencyStrategy(MoeStrategy):
         )
 
     def get_attributes(self) -> StrategyAttributes:
-        from rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.executors.deepgemm_masked_executor import (
-            DeepGemmMaskedExecutor,
-        )
+        # Switched DeepGemmMaskedExecutor → DeepEPLowLatencyTritonExecutor for
+        # an A/B comparison: same DeepEP dispatch/combine, expert compute via
+        # Triton fused_moe_kernel. ``RTP_LLM_DEEPEP_USE_DEEPGEMM=1`` falls back.
+        import os
+
         from rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.routers.deepep_low_latency_router import (
             DeepEpLowLatencyRouter,
         )
 
+        if os.environ.get("RTP_LLM_DEEPEP_USE_DEEPGEMM") == "1":
+            from rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.executors.deepgemm_masked_executor import (
+                DeepGemmMaskedExecutor,
+            )
+
+            executor_class = DeepGemmMaskedExecutor
+        else:
+            from rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.executors.deepep_low_latency_triton_executor import (
+                DeepEPLowLatencyTritonExecutor,
+            )
+
+            executor_class = DeepEPLowLatencyTritonExecutor
+
         quant_config = FusedMoEQuantConfig(quant_dtype=None)
         return StrategyAttributes(
             router_class=DeepEpLowLatencyRouter,
-            executor_class=DeepGemmMaskedExecutor,
+            executor_class=executor_class,
             quant_config=quant_config,
         )
 
