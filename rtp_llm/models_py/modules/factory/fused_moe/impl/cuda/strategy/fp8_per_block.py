@@ -94,12 +94,30 @@ class CudaFp8PerBlockEpLowLatencyStrategy(MoeStrategy):
         )
 
     def get_attributes(self) -> StrategyAttributes:
-        from rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.executors.deepgemm_masked_executor import (
-            DeepGemmMaskedExecutor,
-        )
+        # Switched DeepGemmMaskedExecutor → DeepEPLowLatencyTritonExecutor for
+        # an A/B comparison: same DeepEP dispatch/combine, expert compute now
+        # routed through the Triton fused_moe_kernel (matches what the pure-TP
+        # path uses) so we can read off the kernel mix in nsys timeline. Set
+        # ``RTP_LLM_DEEPEP_USE_DEEPGEMM=1`` to fall back to the masked grouped
+        # GEMM path for direct timing comparison.
+        import os
+
         from rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.routers.deepep_low_latency_router import (
             DeepEpLowLatencyRouter,
         )
+
+        if os.environ.get("RTP_LLM_DEEPEP_USE_DEEPGEMM") == "1":
+            from rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.executors.deepgemm_masked_executor import (
+                DeepGemmMaskedExecutor,
+            )
+
+            executor_class = DeepGemmMaskedExecutor
+        else:
+            from rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.executors.deepep_low_latency_triton_executor import (
+                DeepEPLowLatencyTritonExecutor,
+            )
+
+            executor_class = DeepEPLowLatencyTritonExecutor
 
         quant_config = FusedMoEQuantConfig(
             quant_dtype=torch.float8_e4m3fn,
@@ -107,7 +125,7 @@ class CudaFp8PerBlockEpLowLatencyStrategy(MoeStrategy):
         )
         return StrategyAttributes(
             router_class=DeepEpLowLatencyRouter,
-            executor_class=DeepGemmMaskedExecutor,
+            executor_class=executor_class,
             quant_config=quant_config,
         )
 
