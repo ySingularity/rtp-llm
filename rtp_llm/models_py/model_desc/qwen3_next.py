@@ -54,6 +54,7 @@ from rtp_llm.ops.compute_ops import (
 from rtp_llm.utils.model_weight import W
 from rtp_llm.utils.util import to_torch_dtype
 
+from rtp_llm.ops import HWKernelConfig
 
 class Qwen3NextMetadata(object):
     def __init__(
@@ -441,9 +442,16 @@ class Qwen3NextAttention(CausalAttention):
         weights: Dict[str, torch.Tensor],
         layernorm_eps: float,
         quant_config: Optional[object] = None,
+        hw_kernel_config: Optional["HWKernelConfig"] = None,
     ):
         super().__init__(
-            attn_config, parallelism_config, weights, layernorm_eps, quant_config
+            attn_config,
+            parallelism_config,
+            weights,
+            layernorm_eps,
+            quant_config,
+            hw_kernel_config=hw_kernel_config,
+            enable_pdl=True,
         )
         # Fuse the gate GEMM into the qkv GEMM (one linear with output
         # [qkv | gate] that we slice in forward). Mirrors sglang's
@@ -690,24 +698,29 @@ class Qwen3NextDecoderLayer(nn.Module):
                 config.activation_type, parallelism_config, weights, config.quant_config
             )
 
-        self.input_layernorm = RMSNorm(
+        # fuse residual_add into the layernorm. Same pattern as
+        # GenericMoeDecoderLayer (model_desc/generic_moe.py:236-241).
+        self.input_layernorm = RMSResNorm(
             weights[W.pre_ln_gamma], eps=config.layernorm_eps
         )
-        self.post_attention_layernorm = RMSNorm(
+        self.post_attention_layernorm = RMSResNorm(
             weights[W.post_ln_gamma], eps=config.layernorm_eps
         )
 
     def forward(
         self,
         hidden_states: torch.Tensor,
+        residual: torch.Tensor,
         fmha_impl: FMHAImplBase,
         kv_cache: Optional[LayerKVCache] = None,
         attention_inputs: Optional[PyAttentionInputs] = None,
         attn_meta: Qwen3NextMetadata = Qwen3NextMetadata(),
-    ) -> torch.Tensor:
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
-        # Self Attention
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # Same residual-fusion pattern as GenericMoeDecoderLayer.forward
+        # (model_desc/generic_moe.py:243-266): the previous layer's residual_add
+        # is folded into this layer's RMSResNorm, and the trailing residual_add
+        # is deferred to the next layer (or final_norm in the last layer).
+        hidden_states = self.input_layernorm(hidden_states, residual)
         hidden_states = self.self_attn(
             hidden_states=hidden_states,
             fmha_impl=fmha_impl,
@@ -715,13 +728,9 @@ class Qwen3NextDecoderLayer(nn.Module):
             attention_inputs=attention_inputs,
             attn_meta=attn_meta,
         )
-        hidden_states = residual + hidden_states
-        # Fully Connected
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
-        return hidden_states
+        return hidden_states, residual
 
 
 class Qwen3NextModel(GptModelBase):
@@ -768,7 +777,8 @@ class Qwen3NextModel(GptModelBase):
                 for idx in range(self.layer_num)
             ]
         )
-        self.norm = RMSNorm(
+        # Final norm is RMSResNorm so it can absorb the very last layer's residual.
+        self.norm = RMSResNorm(
             weights.get_global_weight(W.final_ln_gamma), eps=model_config.layernorm_eps
         )
 
@@ -798,18 +808,23 @@ class Qwen3NextModel(GptModelBase):
         if fmha_impl is None:
             fmha_impl = self.prepare_fmha_impl(inputs)
 
+        # Initialise residual to a fresh zero tensor (must be a distinct buffer
+        # from hidden_states because RMSResNorm mutates both in-place).
+        residual = torch.zeros_like(hidden_states)
         for i, decoder_layer in enumerate(self.layers):
             # Switch to correct block_map for this layer in hybrid attention mode
-            gid = select_block_map_for_layer(attention_inputs, i)
-            hidden_states = decoder_layer(
+            select_block_map_for_layer(attention_inputs, i)
+            hidden_states, residual = decoder_layer(
                 hidden_states,
+                residual,
                 fmha_impl,
                 kv_cache=self.kv_cache.get_layer_cache(i) if self.kv_cache else None,
                 attention_inputs=attention_inputs,
                 attn_meta=attn_meta,
             )
 
-        hidden_states = self.norm(hidden_states)
+        # Final RMSResNorm absorbs the trailing residual_add the layers deferred.
+        hidden_states = self.norm(hidden_states, residual)
         return PyModelOutputs(hidden_states, fmha_impl.fmha_params)
 
 
