@@ -451,7 +451,6 @@ class Qwen3NextAttention(CausalAttention):
             layernorm_eps,
             quant_config,
             hw_kernel_config=hw_kernel_config,
-            enable_pdl=True,
         )
         # Fuse the gate GEMM into the qkv GEMM (one linear with output
         # [qkv | gate] that we slice in forward). Mirrors sglang's

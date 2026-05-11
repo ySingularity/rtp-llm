@@ -50,7 +50,7 @@ class RMSResNorm(BaseResNorm):
             residual_out,
             self.weight.data,
             self.variance_epsilon,
-            0, #use_model_sensitive_rmsnorm
+            0,  # use_model_sensitive_rmsnorm
         )
         # NOTE: copy_ may introduce extra overhead.
         residual.copy_(residual_out)
