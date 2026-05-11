@@ -4,6 +4,7 @@
 # Licensed under the Apache License, Version 2.0
 from __future__ import annotations
 
+import os
 from typing import Any, Dict, List, Optional
 
 import torch
@@ -77,6 +78,15 @@ def fused_experts_impl(
     intermediate_cache3: Optional[torch.Tensor] = None,
     out_hidden_states: Optional[torch.Tensor] = None,
     align_scratch: Optional[Dict[str, torch.Tensor]] = None,
+    # DeepEP low-latency masked layout. When all three are supplied, the FP8
+    # silu+mul+per-block-quant step routes through the masked 3D kernel
+    # (one program per (expert, hidden_block, token_partition), iterates only
+    # over valid tokens) instead of the per-row sentinel kernel — same path
+    # the deepgemm masked executor uses (~28× fewer launches in sparse MoE).
+    masked_m: Optional[torch.Tensor] = None,  # (E_local,) int32 valid tokens
+    e_local: Optional[int] = None,  # number of local experts
+    max_recv: Optional[int] = None,  # per-expert padded slot count
+    expected_m: Optional[int] = None,  # heuristic guidance for kernel
 ) -> torch.Tensor:
     """Triton fused MoE forward.
 
@@ -143,35 +153,39 @@ def fused_experts_impl(
             dtype=effective_dtype,
         )
 
-    # NOTE: must be zero-initialized (not just allocated). Rows belonging to
-    # filtered (-1 expert) tokens are never written by ``fused_moe_kernel`` /
-    # ``act_and_mul_kernel`` (they early-return). The downstream
-    # ``_quantize_input_fp8`` of ``intermediate_cache2`` reduces ``max(|row|)``
-    # over those rows; uninitialized memory containing NaN/Inf would
-    # propagate into the per-token scales and corrupt the second GEMM.
-    #
-    # When the caller supplies pre-allocated buffers (the executor route),
-    # they're guaranteed to come zeroed (executor's ``_ensure_buffers``
-    # zero-fills the whole pool in a single kernel). When the caller passes
-    # ``None``, we fall back to per-buffer ``torch.zeros``.
+    # ``filter_expert=True`` plus matching filter logic in the silu+mul+quant
+    # kernel (and in fused_moe_kernel itself, which early-returns on -1 expert
+    # ids) means rows belonging to padded slots are never written *and* never
+    # read downstream — DeepEP combine consumes only the valid prefix indicated
+    # by ``expert_num_tokens``. So we can use ``torch.empty`` here; matches the
+    # deepgemm masked executor (also empty, no zero-init).
     if intermediate_cache1 is None:
-        intermediate_cache1 = torch.zeros(
+        intermediate_cache1 = torch.empty(
             (num_tokens * topk, N),
             device=hidden_states.device,
             dtype=effective_dtype,
         )
-    if intermediate_cache2 is None:
-        intermediate_cache2 = torch.zeros(
-            (num_tokens * topk, N // 2),
-            device=hidden_states.device,
-            dtype=effective_dtype,
-        )
+
+    # Fast-path: when ``topk == 1`` and no router-weight scaling, the down GEMM
+    # writes a ``(num_tokens, 1, hidden)`` tensor that is bit-identical to
+    # ``out_hidden_states.unsqueeze(1)`` — alias them to skip the post-GEMM
+    # ``out_hidden_states.copy_(intermediate_cache3.squeeze(1))`` memcpy. This
+    # is ~13.5ms / profile_step (200×67µs in nsys) on the DeepEP low-latency
+    # path where ``topk`` is forced to 1 by the synthetic single-expert routing.
+    can_alias_out = (
+        not no_combine
+        and topk == 1
+        and (routed_scaling_factor is None or routed_scaling_factor == 1.0)
+    )
     if intermediate_cache3 is None:
-        intermediate_cache3 = torch.zeros(
-            (num_tokens, topk, w2.shape[1]),
-            device=hidden_states.device,
-            dtype=effective_dtype,
-        )
+        if can_alias_out:
+            intermediate_cache3 = out_hidden_states.unsqueeze(1)
+        else:
+            intermediate_cache3 = torch.empty(
+                (num_tokens, topk, w2.shape[1]),
+                device=hidden_states.device,
+                dtype=effective_dtype,
+            )
 
     if use_fp8_w8a8:
         assert w1_scale is not None
@@ -213,32 +227,126 @@ def fused_experts_impl(
         filter_expert=filter_expert,
     )
 
-    # Activation. When no per-rank expert filtering is needed we can fall back
-    # to the fast C++/flashinfer-style ``silu_and_mul`` (matches sglang MTP's
-    # trace which shows ``flashinfer::act_and_mul_kernel`` here). Otherwise we
-    # use the Triton variant that honors ``-1`` filter sentinels in topk_ids.
-    if activation == "silu" and not filter_expert:
-        from rtp_llm.models_py.triton_kernels.common.activation import (
-            silu_and_mul as _silu_and_mul,
+    # silu+mul + per-block-fp8-quant fusion. For FP8 W8A8 with per-block
+    # scales (the DeepEP low-latency / qwen3.5 MoE path), use the dedicated
+    # ``silu_mul_post_quant_flat_fwd`` Triton kernel — it expects RTP-LLM's
+    # ``[up | gate]`` layout and produces row-major fp32 scales matching what
+    # ``sgl_per_token_group_quant_fp8(...)`` would have produced, so the down
+    # GEMM consumes them transparently. This collapses the original 2-kernel
+    # ``act_and_mul_kernel`` + ``per_token_group_quant_8bit_kernel`` (~9.5ms /
+    # 200 calls in profile) into one launch and drops ``intermediate_cache2``
+    # entirely.
+    fuse_silu_mul_quant = (
+        use_fp8_w8a8
+        and block_shape is not None
+        and activation == "silu"
+        and not per_channel_quant
+    )
+    if fuse_silu_mul_quant:
+        M_total = num_tokens * topk
+        H_half = N // 2
+        block_k = block_shape[1]
+        # Prefer the masked 3D kernel (deepgemm-style) when DeepEP layout
+        # metadata is available — it visits only ``masked_m[e]`` valid tokens
+        # per expert instead of all padded slots, ~28× fewer programs in our
+        # sparse MoE. Falls back to the per-row sentinel kernel when we don't
+        # have the (E, T) layout (e.g. pure-TP path).
+        use_masked_3d = (
+            masked_m is not None
+            and e_local is not None
+            and max_recv is not None
+            and M_total == e_local * max_recv
         )
+        if use_masked_3d:
+            from rtp_llm.models_py.triton_kernels.common.activation import (
+                silu_mul_masked_fp8_post_quant_fwd,
+            )
 
-        _silu_and_mul(intermediate_cache2, intermediate_cache1.view(-1, N))
-    elif activation in ("silu", "gelu"):
-        act_and_mul_triton(
-            intermediate_cache1.view(-1, N),
-            intermediate_cache2,
-            topk_ids=topk_ids,
-            activation=activation,
-        )
-    else:
-        raise ValueError(f"Unsupported activation: {activation}")
+            # 3D outputs match deepgemm-fused kernel's layout.
+            # output_q: (E, T, H_half) fp8;  output_s: (E, T, H_half/block_k) fp32.
+            # Flat 2D views (for the down GEMM) are contiguous, same row-major
+            # layout produced by the per-row kernel — drop-in compatible with
+            # ``invoke_fused_moe_kernel``.
+            a2_q_3d = torch.empty(
+                (e_local, max_recv, H_half),
+                device=hidden_states.device,
+                dtype=torch.float8_e4m3fn,
+            )
+            a2_s_3d = torch.empty(
+                (e_local, max_recv, H_half // block_k),
+                device=hidden_states.device,
+                dtype=torch.float32,
+            )
+            silu_mul_masked_fp8_post_quant_fwd(
+                input=intermediate_cache1.view(e_local, max_recv, N),
+                output=a2_q_3d,
+                output_scale=a2_s_3d,
+                quant_group_size=block_k,
+                masked_m=masked_m,
+                expected_m=expected_m if expected_m is not None else max_recv,
+                scale_ue8m0=False,
+            )
+            a2_q = a2_q_3d.view(M_total, H_half)
+            a2_s = a2_s_3d.view(M_total, H_half // block_k)
+        else:
+            from rtp_llm.models_py.triton_kernels.common.activation import (
+                silu_mul_post_quant_flat_fwd,
+            )
 
-    if use_fp8_w8a8:
-        a2_q, a2_s = _quantize_input_fp8(
-            intermediate_cache2, a2_scale, block_shape, per_channel_quant
-        )
+            a2_q = torch.empty(
+                (M_total, H_half),
+                device=hidden_states.device,
+                dtype=torch.float8_e4m3fn,
+            )
+            # Row-major fp32 scales — matches the layout
+            # ``sgl_per_token_group_quant_fp8(column_major_scales=False)`` and
+            # the masked 3D kernel produce, so the down GEMM consumes either
+            # via the same ``A_scale.stride(0/1)`` indexing.
+            a2_s = torch.empty(
+                (M_total, H_half // block_k),
+                device=hidden_states.device,
+                dtype=torch.float32,
+            )
+            silu_mul_post_quant_flat_fwd(
+                input=intermediate_cache1.view(M_total, N),
+                output_q=a2_q,
+                output_s=a2_s,
+                quant_group_size=block_k,
+                topk_ids=topk_ids if filter_expert else None,
+                scale_ue8m0=False,
+            )
     else:
-        a2_q, a2_s = intermediate_cache2, None
+        # Fallback 2-kernel path (activation + separate quant). Allocate
+        # ``intermediate_cache2`` lazily here — it's only needed in this
+        # branch.
+        if intermediate_cache2 is None:
+            intermediate_cache2 = torch.empty(
+                (num_tokens * topk, N // 2),
+                device=hidden_states.device,
+                dtype=effective_dtype,
+            )
+        if activation == "silu" and not filter_expert:
+            from rtp_llm.models_py.triton_kernels.common.activation import (
+                silu_and_mul as _silu_and_mul,
+            )
+
+            _silu_and_mul(intermediate_cache2, intermediate_cache1.view(-1, N))
+        elif activation in ("silu", "gelu"):
+            act_and_mul_triton(
+                intermediate_cache1.view(-1, N),
+                intermediate_cache2,
+                topk_ids=topk_ids,
+                activation=activation,
+            )
+        else:
+            raise ValueError(f"Unsupported activation: {activation}")
+
+        if use_fp8_w8a8:
+            a2_q, a2_s = _quantize_input_fp8(
+                intermediate_cache2, a2_scale, block_shape, per_channel_quant
+            )
+        else:
+            a2_q, a2_s = intermediate_cache2, None
 
     invoke_fused_moe_kernel(
         a2_q,
@@ -269,7 +377,13 @@ def fused_experts_impl(
         routed_scaling_factor = 1.0
 
     if topk == 1 and routed_scaling_factor == 1.0:
-        out_hidden_states.copy_(intermediate_cache3.squeeze(1))
+        # ``can_alias_out`` above made ``intermediate_cache3`` a view of
+        # ``out_hidden_states.unsqueeze(1)``, so the down GEMM has already
+        # written into ``out_hidden_states`` — skip the redundant copy_().
+        # When the caller supplied a non-aliasable ``intermediate_cache3``
+        # (e.g. a custom buffer), still need to copy.
+        if intermediate_cache3.data_ptr() != out_hidden_states.data_ptr():
+            out_hidden_states.copy_(intermediate_cache3.squeeze(1))
     elif topk == 2 and routed_scaling_factor == 1.0:
         torch.add(
             intermediate_cache3[:, 0],

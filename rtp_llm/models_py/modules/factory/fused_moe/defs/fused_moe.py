@@ -39,6 +39,13 @@ class ExpertForwardPayload:
     expert_tokens_meta: Optional[ExpertTokensMetadata] = None
     expert_topk_ids: Optional[torch.Tensor] = None
     expert_topk_weights: Optional[torch.Tensor] = None
+    # Pre-allocated output buffer the executor MUST write its expert outputs
+    # into (when set). Used by DeepEP low-latency to avoid the ~67µs
+    # ``memcpy128`` staging step in ``low_latency_combine`` — the router
+    # supplies the NVSHMEM-backed combine buffer here, the executor writes
+    # directly into it, and the router calls combine with ``zero_copy=True``.
+    # When ``None`` the executor allocates its own output (legacy behavior).
+    output_buffer: Optional[torch.Tensor] = None
 
 
 @dataclass

@@ -17,6 +17,8 @@
 from typing import Any, Dict, Optional
 
 import torch
+import triton
+import triton.language as tl
 
 from rtp_llm.models_py.modules.factory.fused_moe.defs.config_adapter import (
     MoEConfigAdapter,
@@ -32,6 +34,57 @@ from rtp_llm.models_py.modules.factory.fused_moe.defs.quant_config import (
 from rtp_llm.models_py.modules.factory.fused_moe.defs.type import ExecutorType
 from rtp_llm.models_py.triton_kernels.moe.fused_moe_triton import fused_experts_impl
 from rtp_llm.utils.model_weight import W
+
+
+@triton.jit
+def _build_topk_ids_kernel(
+    out_ptr,  # (n_total,) int32 — output topk_ids (will be unsqueezed by caller)
+    row_eid_ptr,  # (n_total,) int32 — row → owning local expert id (cached template)
+    row_pos_ptr,  # (n_total,) int32 — row → position within that expert's slots
+    expert_num_tokens_ptr,  # (e_local,)  int32 — valid token count per local expert (from dispatch)
+    n_total: tl.int32,
+    BLOCK: tl.constexpr,
+):
+    """Fused gather + compare + select for DeepEP low-latency routing.
+
+    Replaces the 3-launch sequence
+        per_row_recv = expert_num_tokens[row_eid]   # gather
+        valid_mask   = row_pos < per_row_recv       # compare
+        topk_ids     = where(valid_mask, row_eid, -1)
+    with a single Triton kernel — saves ~1.5 ms in the elementwise/fill bucket
+    (200 layer-steps × ~7-10 µs of accumulated gather/compare/where launch
+    overhead).
+    """
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < n_total
+    eid = tl.load(row_eid_ptr + offs, mask=mask, other=0)
+    pos = tl.load(row_pos_ptr + offs, mask=mask, other=0)
+    limit = tl.load(expert_num_tokens_ptr + eid, mask=mask, other=0)
+    out = tl.where(pos < limit, eid, -1)
+    tl.store(out_ptr + offs, out, mask=mask)
+
+
+def _build_topk_ids(
+    row_eid: torch.Tensor,
+    row_pos: torch.Tensor,
+    expert_num_tokens: torch.Tensor,
+    out_buf: torch.Tensor,
+) -> torch.Tensor:
+    """Fill ``out_buf`` (n_total,) int32 with valid expert ids / -1 sentinel."""
+    n_total = row_eid.shape[0]
+    BLOCK = 256
+    grid = (triton.cdiv(n_total, BLOCK),)
+    _build_topk_ids_kernel[grid](
+        out_buf,
+        row_eid,
+        row_pos,
+        expert_num_tokens,
+        n_total,
+        BLOCK=BLOCK,
+        num_warps=2,
+    )
+    return out_buf
 
 
 class DeepEPLowLatencyTritonExecutor(FusedMoeExpertExecutor):
@@ -78,28 +131,38 @@ class DeepEPLowLatencyTritonExecutor(FusedMoeExpertExecutor):
         self.w13_weight_scale = weights.get(W.moe_s1, None)
         self.w2_weight_scale = weights.get(W.moe_s2, None)
 
-        # Pre-compute the per-row local-expert id template; we mask-out invalid
-        # rows (topk = -1) at runtime using ``expert_num_tokens``.
-        self._row_eid_template: Optional[torch.Tensor] = None
-        self._row_pos_template: Optional[torch.Tensor] = None
+        # Per-row routing scratch — all of these are constant across forwards
+        # in low-latency mode (e_local, max_recv fixed). Cache once on first
+        # ``execute`` to avoid per-layer allocations / fills (~2-3 ms in the
+        # elementwise/fill bucket).
+        self._row_eid_template: Optional[torch.Tensor] = None  # (n_total,) int32
+        self._row_pos_template: Optional[torch.Tensor] = None  # (n_total,) int32
+        self._topk_weights_template: Optional[torch.Tensor] = (
+            None  # (n_total, 1) fp32 ones
+        )
+        self._topk_ids_buf: Optional[torch.Tensor] = (
+            None  # (n_total,) int32 — kernel output
+        )
 
-    def _get_row_templates(
+    def _ensure_routing_buffers(
         self, e_local: int, max_recv: int, device: torch.device
-    ) -> "tuple[torch.Tensor, torch.Tensor]":
-        """Build (per-row local-expert id, per-row local position) once and
-        cache. Both have shape (E_local * max_recv,). Stable across forwards
-        since e_local and max_recv are fixed in low-latency mode.
-        """
+    ) -> None:
+        """Lazily allocate routing scratch tensors. Constant across forwards
+        in low-latency mode (e_local, max_recv fixed)."""
         n_total = e_local * max_recv
         if (
-            self._row_eid_template is None
-            or self._row_eid_template.numel() != n_total
-            or self._row_eid_template.device != device
+            self._row_eid_template is not None
+            and self._row_eid_template.numel() == n_total
+            and self._row_eid_template.device == device
         ):
-            row_idx = torch.arange(n_total, device=device, dtype=torch.int64)
-            self._row_eid_template = (row_idx // max_recv).to(torch.int32)
-            self._row_pos_template = row_idx % max_recv
-        return self._row_eid_template, self._row_pos_template  # type: ignore[return-value]
+            return
+        row_idx = torch.arange(n_total, device=device, dtype=torch.int32)
+        self._row_eid_template = row_idx // max_recv
+        self._row_pos_template = row_idx % max_recv
+        self._topk_weights_template = torch.ones(
+            (n_total, 1), device=device, dtype=torch.float32
+        )
+        self._topk_ids_buf = torch.empty((n_total,), device=device, dtype=torch.int32)
 
     def execute(
         self,
@@ -138,26 +201,48 @@ class DeepEPLowLatencyTritonExecutor(FusedMoeExpertExecutor):
 
         # Build single-expert routing: row i → expert i//max_recv, position i%max_recv.
         # Padded slots (position >= expert_num_tokens[expert]) get topk_id = -1
-        # so the Triton kernel skips them.
-        row_eid, row_pos = self._get_row_templates(e_local, max_recv, device)
+        # so the Triton kernel skips them. Single fused Triton kernel replaces
+        # the prior 4-launch sequence (gather + compare + where + fill).
         assert payload.expert_tokens_meta is not None
-        expert_num_tokens = payload.expert_tokens_meta.expert_num_tokens  # (E_local,)
-        # Gather per-row recv-count of its owning expert, then compare.
-        per_row_recv = expert_num_tokens.to(torch.int64)[row_eid.to(torch.int64)]
-        valid_mask = row_pos < per_row_recv  # (n_total,)
-        topk_ids = torch.where(
-            valid_mask,
-            row_eid,
-            torch.full_like(row_eid, -1),
-        ).unsqueeze(
-            1
-        )  # (n_total, 1)
-        topk_weights = torch.ones((n_total, 1), device=device, dtype=torch.float32)
+        expert_num_tokens = (
+            payload.expert_tokens_meta.expert_num_tokens
+        )  # (E_local,) int32
+        self._ensure_routing_buffers(e_local, max_recv, device)
+        _build_topk_ids(
+            self._row_eid_template,
+            self._row_pos_template,
+            expert_num_tokens,
+            self._topk_ids_buf,
+        )
+        topk_ids = self._topk_ids_buf.unsqueeze(1)
+        topk_weights = self._topk_weights_template
 
         # DeepEP combine re-applies the *real* topk_weights on the recv side,
         # so here we want raw expert outputs — pass topk_weights = 1 and
         # apply_router_weight_on_input = False.
         out_dtype = payload.expert_x_origin_dtype or torch.bfloat16
+        # Zero-copy: when the router pre-allocated a NVSHMEM-backed output
+        # buffer, write the expert outputs straight into it (flat view) so
+        # ``low_latency_combine(zero_copy=True)`` can reduce in-place without
+        # the upfront ``memcpy128`` staging.
+        out_hidden_states_buf: Optional[torch.Tensor] = None
+        if payload.output_buffer is not None:
+            assert payload.output_buffer.shape == (e_local, max_recv, hidden), (
+                f"output_buffer shape {payload.output_buffer.shape} != "
+                f"({e_local}, {max_recv}, {hidden})"
+            )
+            out_hidden_states_buf = payload.output_buffer.view(n_total, hidden)
+
+        # Pass DeepEP layout metadata so fused_experts_impl can use the masked
+        # 3D silu+mul+per-block-quant kernel (~28× cheaper than the per-row
+        # sentinel path for sparse MoE — only valid tokens per expert are
+        # processed).
+        expected_m = (
+            int(payload.expert_tokens_meta.expected_m)
+            if payload.expert_tokens_meta is not None
+            and payload.expert_tokens_meta.expected_m is not None
+            else max_recv
+        )
         out = fused_experts_impl(
             hidden_states=flat_x,
             w1=self.w13_weight,
@@ -176,9 +261,19 @@ class DeepEPLowLatencyTritonExecutor(FusedMoeExpertExecutor):
             block_shape=self.block_shape,
             out_dtype=out_dtype,
             filter_expert=True,  # honor topk_id == -1 sentinel for padded rows
+            out_hidden_states=out_hidden_states_buf,
+            masked_m=expert_num_tokens,
+            e_local=e_local,
+            max_recv=max_recv,
+            expected_m=expected_m,
         )
 
-        # out: (n_total, hidden) bf16 — reshape back to packed (E_local, max_recv, hidden)
-        # for DeepEP combine.
-        packed_out = out.reshape(e_local, max_recv, hidden)
+        # When zero-copy is on the fused_moe write went straight into the
+        # NVSHMEM 3D buffer; return that directly (DeepEP combine asserts
+        # input is 3D + contiguous, and chained ``.view().reshape()`` views
+        # of NVSHMEM buffers occasionally fail the contiguity check).
+        if payload.output_buffer is not None:
+            packed_out = payload.output_buffer
+        else:
+            packed_out = out.reshape(e_local, max_recv, hidden).contiguous()
         return CombineForwardPayload(fused_expert_output=packed_out)
