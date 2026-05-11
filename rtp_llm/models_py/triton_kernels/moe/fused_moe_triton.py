@@ -52,6 +52,20 @@ def _quantize_input_fp8(
     return sgl_per_token_group_quant_fp8(A, block_k)
 
 
+def _expected_block_size_m_for_caller_align(
+    use_fp8_w8a8: bool, block_shape: Optional[List[int]]
+) -> int:
+    """Mirror of ``try_get_optimal_moe_config``'s BLOCK_SIZE_M choice for the
+    code paths where callers pre-compute moe_align outputs. Used only by the
+    runtime assertion that detects config-vs-caller drift."""
+    if use_fp8_w8a8 and block_shape is not None:
+        # FP8 W8A8 + per-block path: BSM=64 (hardcoded in fused_moe_triton_config).
+        return 64
+    # Other paths: BSM=64 by default; specific BSM=16 only kicks in for the
+    # ``M <= E`` no-block case which DeepEP layout doesn't hit.
+    return 64
+
+
 def fused_experts_impl(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -87,6 +101,28 @@ def fused_experts_impl(
     e_local: Optional[int] = None,  # number of local experts
     max_recv: Optional[int] = None,  # per-expert padded slot count
     expected_m: Optional[int] = None,  # heuristic guidance for kernel
+    # DeepEP fast-path for ``moe_align_block_size``. When all three are
+    # supplied (already computed by the executor's specialized
+    # ``deepep_moe_align``), skip the 4 generic align kernels + 4 scratch
+    # fills entirely. The supplied buffers must have the same semantics that
+    # ``moe_align_block_size`` would produce (sparsity-prune preserved):
+    # ``num_tokens_post_padded`` is the *actual* sum of per-expert padded
+    # counts, not a worst-case constant.
+    sorted_token_ids: Optional[torch.Tensor] = None,
+    expert_ids: Optional[torch.Tensor] = None,
+    num_tokens_post_padded: Optional[torch.Tensor] = None,
+    # Pre-allocated FP8 quant outputs for the masked silu+mul+quant fast-path.
+    # When provided, ``silu_mul_masked_fp8_post_quant_fwd`` writes into them
+    # instead of fresh ``torch.empty`` allocations — required for CUDA Graph
+    # multi-stream overlap (every torch.empty inside the captured graph spawns
+    # a new caching-allocator pool, which doubles memory under multi-stream
+    # capture and OOMs).
+    #
+    # Shapes:
+    #   a2_q_3d:  (e_local, max_recv, N // 2)  fp8_e4m3
+    #   a2_s_3d:  (e_local, max_recv, N // 2 // block_shape[1])  fp32
+    a2_q_3d: Optional[torch.Tensor] = None,
+    a2_s_3d: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Triton fused MoE forward.
 
@@ -124,6 +160,11 @@ def fused_experts_impl(
         block_shape=block_shape,
     )
 
+    # If the caller pre-computed (sorted_token_ids, expert_ids,
+    # num_tokens_post_padded) — e.g. via the DeepEP-specialized
+    # ``deepep_moe_align`` — skip the generic moe_align entirely. Otherwise
+    # fall through to the per-call alignment for arbitrary topk_ids.
+    #
     # NOTE: persistent ``align_scratch`` is currently disabled — it caused
     # garbage outputs in smoke tests, suspected scratch-buffer reallocation
     # across CUDA graph captures invalidating previously-baked pointers. The
@@ -131,9 +172,22 @@ def fused_experts_impl(
     # vs. legacy implementation); only the per-call scratch reuse is buggy.
     # Leaving the codepath in place for future re-enablement once root-cause
     # is fixed; for now we always allocate scratch fresh.
-    sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
-        topk_ids, config["BLOCK_SIZE_M"], E, scratch=None
-    )
+    if sorted_token_ids is None:
+        sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
+            topk_ids, config["BLOCK_SIZE_M"], E, scratch=None
+        )
+    else:
+        assert (
+            expert_ids is not None and num_tokens_post_padded is not None
+        ), "sorted_token_ids/expert_ids/num_tokens_post_padded must be supplied together"
+        assert config["BLOCK_SIZE_M"] == _expected_block_size_m_for_caller_align(
+            use_fp8_w8a8, block_shape
+        ), (
+            f"caller pre-computed routing buffers assume BLOCK_SIZE_M="
+            f"{_expected_block_size_m_for_caller_align(use_fp8_w8a8, block_shape)}"
+            f" but config picked {config['BLOCK_SIZE_M']}; "
+            f"fused_moe_triton_config drift?"
+        )
 
     # Output buffer (allocate if caller didn't supply one).
     if no_combine:
@@ -266,17 +320,23 @@ def fused_experts_impl(
             # output_q: (E, T, H_half) fp8;  output_s: (E, T, H_half/block_k) fp32.
             # Flat 2D views (for the down GEMM) are contiguous, same row-major
             # layout produced by the per-row kernel — drop-in compatible with
-            # ``invoke_fused_moe_kernel``.
-            a2_q_3d = torch.empty(
-                (e_local, max_recv, H_half),
-                device=hidden_states.device,
-                dtype=torch.float8_e4m3fn,
-            )
-            a2_s_3d = torch.empty(
-                (e_local, max_recv, H_half // block_k),
-                device=hidden_states.device,
-                dtype=torch.float32,
-            )
+            # ``invoke_fused_moe_kernel``. Caller may pre-allocate (and pass
+            # in via the ``a2_q_3d`` / ``a2_s_3d`` kwargs) — required when
+            # this layer is captured into a CUDA graph that is replayed
+            # cross-stream, since per-call ``torch.empty`` would force a new
+            # caching-allocator pool for the side stream and OOM.
+            if a2_q_3d is None:
+                a2_q_3d = torch.empty(
+                    (e_local, max_recv, H_half),
+                    device=hidden_states.device,
+                    dtype=torch.float8_e4m3fn,
+                )
+            if a2_s_3d is None:
+                a2_s_3d = torch.empty(
+                    (e_local, max_recv, H_half // block_k),
+                    device=hidden_states.device,
+                    dtype=torch.float32,
+                )
             silu_mul_masked_fp8_post_quant_fwd(
                 input=intermediate_cache1.view(e_local, max_recv, N),
                 output=a2_q_3d,
