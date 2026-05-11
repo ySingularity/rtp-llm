@@ -86,7 +86,13 @@ class DeepEpLowLatencyRouter(FusedMoeDataRouter):
         self._num_topk = wrapper.num_topk
         self._num_max_dispatch_tokens_per_rank = wrapper.ll_num_max_token_per_rank
         self._use_fp8_dispatch = use_fp8_dispatch
-        self._zero_copy = False
+        # Zero-copy is gated off by default: ``get_next_low_latency_combine_buffer(handle)``
+        # is a host-side op that depends on the just-dispatched handle, which
+        # doesn't survive CUDA graph capture (the buffer goes stale on replay
+        # — DeepEP combine asserts non-3D / non-contiguous on the staged
+        # view). Set ``RTP_LLM_DEEPEP_ENABLE_ZERO_COPY=1`` to re-enable for
+        # eager-mode A/B testing once a graph-friendly buffer hookup lands.
+        self._zero_copy = os.environ.get("RTP_LLM_DEEPEP_ENABLE_ZERO_COPY") == "1"
         self._async_finish = False
         self._return_recv_hook = False
         self._opt_level = int(os.environ.get("ACCL_LOW_LATENCY_OPTIMIZE", 1))
@@ -158,6 +164,17 @@ class DeepEpLowLatencyRouter(FusedMoeDataRouter):
             expert_x = expert_x
             expert_x_scale = None
 
+        # Zero-copy: hand the executor the NVSHMEM-backed combine buffer so it
+        # can write expert outputs in-place, skipping low_latency_combine's
+        # internal staging memcpy (~67µs / call). Combined with
+        # ``self._zero_copy = True`` below this removes the ``memcpy128``
+        # kernel that was visible right before each combine in nsys traces.
+        output_buffer: Optional[torch.Tensor] = None
+        if self._zero_copy:
+            output_buffer = self._buffer.get_next_low_latency_combine_buffer(
+                self._handle
+            )
+
         # Return expert forward payload
         return ExpertForwardPayload(
             expert_x=expert_x,
@@ -169,6 +186,7 @@ class DeepEpLowLatencyRouter(FusedMoeDataRouter):
                 expected_m=expected_m,
                 expert_num_tokens=expert_num_tokens,
             ),
+            output_buffer=output_buffer,
         )
 
     def prepare(

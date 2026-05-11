@@ -1067,6 +1067,139 @@ def silu_mul_masked_fp8_post_quant_fwd(
     return
 
 
+# ---------------------------------------------------------------------------
+# Flat-layout fused silu+mul+per-block-fp8-quant for the Triton fused_moe path.
+# Replaces ``act_and_mul_kernel`` + ``per_token_group_quant_8bit`` (the two
+# separate kernels in ``fused_experts_impl``) with a single launch.
+#
+# Input layout convention: ``[up | gate]`` (RTP-LLM's order, matches both
+# ``act_and_mul_kernel`` and ``_silu_mul_masked_fp8_post_quant_fwd``).
+# This is opposite to sgl-kernel's ``sgl_per_token_group_quant_8bit_v2``
+# (which assumes ``[gate | up]``) — that's why we don't reuse it here.
+# ---------------------------------------------------------------------------
+@triton.jit
+def _silu_mul_post_quant_flat_kernel(
+    input_ptr,
+    stride_in_n,
+    stride_in_h,
+    output_q_ptr,
+    stride_oq_n,
+    stride_oq_h,
+    output_s_ptr,
+    stride_os_n,
+    stride_os_g,
+    topk_ids_ptr,  # (N,) int32 — filter when expert id == -1
+    H: tl.constexpr,  # half hidden = output dim
+    GROUP_SIZE: tl.constexpr,
+    fp8_max: tl.constexpr,
+    fp8_min: tl.constexpr,
+    eps: tl.constexpr,
+    FILTER_EXPERT: tl.constexpr,
+    SCALE_UE8M0: tl.constexpr,
+):
+    pid_n = tl.program_id(0).to(tl.int64)
+    pid_g = tl.program_id(1).to(tl.int64)
+
+    # Filter rows whose expert id is the -1 sentinel (padded slots from
+    # moe_align_block_size or unused top_k entries).
+    if FILTER_EXPERT:
+        eid = tl.load(topk_ids_ptr + pid_n)
+        if eid == -1:
+            return
+
+    h_offsets = pid_g * GROUP_SIZE + tl.arange(0, GROUP_SIZE).to(tl.int64)
+    # [up | gate] → up = first half, gate = second half.
+    up_ptrs = input_ptr + pid_n * stride_in_n + h_offsets * stride_in_h
+    gate_ptrs = input_ptr + pid_n * stride_in_n + (H + h_offsets) * stride_in_h
+
+    up = tl.load(up_ptrs).to(tl.float32)
+    gate = tl.load(gate_ptrs).to(tl.float32)
+
+    # silu(gate) * up
+    y = (gate / (1.0 + tl.exp(-gate))) * up
+
+    # per-block fp8 quant
+    max_abs = tl.maximum(tl.max(tl.abs(y)), eps)
+    scale = max_abs / fp8_max
+    if SCALE_UE8M0:
+        scale = tl.exp2(tl.ceil(tl.log2(scale)))
+    inv_scale = 1.0 / scale
+    y_q = tl.clamp(y * inv_scale, fp8_min, fp8_max).to(output_q_ptr.dtype.element_ty)
+
+    out_q_ptrs = output_q_ptr + pid_n * stride_oq_n + h_offsets * stride_oq_h
+    tl.store(out_q_ptrs, y_q)
+    tl.store(output_s_ptr + pid_n * stride_os_n + pid_g * stride_os_g, scale)
+
+
+def silu_mul_post_quant_flat_fwd(
+    input: torch.Tensor,
+    output_q: torch.Tensor,
+    output_s: torch.Tensor,
+    quant_group_size: int,
+    topk_ids: torch.Tensor = None,
+    scale_ue8m0: bool = False,
+):
+    """Flat-layout fused silu(gate)*up + per-block FP8 quant.
+
+    Replaces ``act_and_mul_kernel + per_token_group_quant_8bit`` for the
+    Triton fused_moe path. Honors the ``-1`` sentinel in ``topk_ids`` to skip
+    padded rows (matches the existing filter_expert behavior).
+
+    Args:
+        input: ``(N, 2*H)`` bf16/fp16, contiguous, layout ``[up | gate]``.
+        output_q: ``(N, H)`` fp8, contiguous.
+        output_s: ``(N, H // group_size)`` fp32, contiguous.
+        quant_group_size: e.g. 128.
+        topk_ids: optional ``(N, ...)`` int32 — when supplied, rows whose
+            (flattened) entry is ``-1`` are skipped. Shape compat: ``view(-1)``
+            is taken; expects same N as input rows.
+        scale_ue8m0: round scale to power-of-two (Blackwell SM 10+).
+    """
+    assert input.is_contiguous()
+    assert output_q.is_contiguous() and output_q.dtype == torch.float8_e4m3fn
+    assert output_s.is_contiguous() and output_s.dtype == torch.float32
+    assert input.dim() == 2 and input.shape[1] % 2 == 0
+    N, two_H = input.shape
+    H = two_H // 2
+    assert H % quant_group_size == 0
+    assert output_q.shape == (N, H)
+    assert output_s.shape == (N, H // quant_group_size)
+
+    finfo = torch.finfo(torch.float8_e4m3fn)
+    fp8_max = finfo.max
+    fp8_min = -fp8_max
+
+    if topk_ids is not None:
+        topk_flat = topk_ids.reshape(-1).contiguous().to(torch.int32)
+        assert topk_flat.numel() == N
+        FILTER = True
+    else:
+        topk_flat = torch.empty(0, device=input.device, dtype=torch.int32)
+        FILTER = False
+
+    grid = (N, H // quant_group_size)
+    _silu_mul_post_quant_flat_kernel[grid](
+        input,
+        input.stride(0),
+        input.stride(1),
+        output_q,
+        output_q.stride(0),
+        output_q.stride(1),
+        output_s,
+        output_s.stride(0),
+        output_s.stride(1),
+        topk_flat,
+        H=H,
+        GROUP_SIZE=quant_group_size,
+        fp8_max=fp8_max,
+        fp8_min=fp8_min,
+        eps=1e-10,
+        FILTER_EXPERT=FILTER,
+        SCALE_UE8M0=scale_ue8m0,
+        num_warps=1,
+    )
+
+
 @triton.jit
 def _silu_mul_masked_bf16_no_post_quant_fwd(
     input_ptr,
