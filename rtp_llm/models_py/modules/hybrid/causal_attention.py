@@ -30,7 +30,6 @@ class CausalAttention(nn.Module):
         quant_config: Optional[object] = None,
         hw_kernel_config: Optional["HWKernelConfig"] = None,
         layer_idx: int = 0,
-        enable_pdl: bool = False,
     ):
         super().__init__()
         self.layer_idx = layer_idx
@@ -73,7 +72,6 @@ class CausalAttention(nn.Module):
                 attn_config.kv_head_num,
                 attn_config.size_per_head,
                 layernorm_eps,
-                enable_pdl=enable_pdl,
             )
 
     def forward(

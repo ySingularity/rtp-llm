@@ -56,9 +56,7 @@ class Qwen3NextMTPModel(GptModelBase):
             eps=model_config.layernorm_eps,
         )
         self.fc = LinearFactory.create_linear_from_weights(
-            weights.global_weights,
-            W.multi_tokens_predict_eh_proj,
-            hw_kernel_config=py_hw_kernel_config,
+            weights.global_weights, W.multi_tokens_predict_eh_proj
         )
         # Get enable_cuda_graph from py_hw_kernel_config
         enable_cuda_graph = (
@@ -76,11 +74,13 @@ class Qwen3NextMTPModel(GptModelBase):
                     moe_config,
                     max_generate_batch_size,
                     enable_cuda_graph,
-                    hw_kernel_config=py_hw_kernel_config,
                 )
                 for idx in range(self.layer_num)
             ]
         )
+        # Final norm is RMSResNorm so it can absorb the very last layer's
+        # deferred residual_add, matching Qwen3NextModel after the residual
+        # fusion refactor (see qwen3_next.py:907-908).
         self.norm = RMSResNorm(
             weights.get_global_weight(W.final_ln_gamma), eps=model_config.layernorm_eps
         )
@@ -99,6 +99,8 @@ class Qwen3NextMTPModel(GptModelBase):
             fmha_impl = self.prepare_fmha_impl(
                 inputs
             )  # pyright: ignore[reportUnreachable]
+        # Initialise residual to a fresh zero tensor (must be a distinct buffer
+        # from hidden_states because RMSResNorm mutates both in-place).
         residual = torch.zeros_like(hidden_states)
         for i, decoder_layer in enumerate(self.layers):
             select_block_map_for_layer(attention_inputs, i)
@@ -111,5 +113,6 @@ class Qwen3NextMTPModel(GptModelBase):
                 attention_inputs=inputs.attention_inputs,
                 attn_meta=Qwen3NextMetadata(),
             )
-        hidden_states, residual = self.norm(hidden_states, residual)
+        # Final RMSResNorm absorbs the trailing residual_add the layers deferred.
+        hidden_states = self.norm(hidden_states, residual)
         return PyModelOutputs(hidden_states, fmha_impl.fmha_params)

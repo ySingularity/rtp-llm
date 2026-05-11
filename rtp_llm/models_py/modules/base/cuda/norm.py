@@ -89,7 +89,7 @@ class FusedQKRMSNorm(nn.Module):
         kv_head_num: int,
         size_per_head: int = 128,
         eps: float = 1e-6,
-        enable_pdl: bool = False,
+        enable_pdl: bool = True,
     ):
         super().__init__()
         self.q_weight = q_weight
