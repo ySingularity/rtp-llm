@@ -104,6 +104,17 @@ class GenericMoeLayer(nn.Module):
         # for group topk
         self.correction_bias = weights.get(W.e_score_correction_b, None)
 
+        # Per-layer side stream for routed-MoE / shared-expert overlap. Only
+        # allocated when the layer actually has a shared expert. This is safe
+        # under CUDA Graph capture *because* the executor pre-allocates every
+        # heavy intermediate buffer (intermediate_cache1, out_hidden_states,
+        # a2_q_3d, a2_s_3d, align outputs) — so no caching-allocator activity
+        # happens on the side stream during capture, which would otherwise
+        # spawn a second private pool and OOM.
+        self.moe_side_stream: Optional[torch.cuda.Stream] = None
+        if self.shared_expert is not None:
+            self.moe_side_stream = torch.cuda.Stream()
+
     def _maybe_external_dp_gather(
         self, local_hidden: torch.Tensor
     ) -> "tuple[torch.Tensor, int, int, int]":
@@ -208,27 +219,50 @@ class GenericMoeLayer(nn.Module):
         if self.fake_balance_expert is not None:
             self.fake_balance_expert(topk_ids, topk_weights)
 
+        # Two-stream overlap: routed MoE on side stream, shared expert on
+        # default stream. They re-converge at sigmoid_gate_scale_add / + .
+        # See comment on ``self.moe_side_stream`` in __init__ for why this is
+        # safe under CUDA Graph capture (executor pre-allocates buffers).
+        use_side = self.shared_expert is not None and self.moe_side_stream is not None
+        if use_side:
+            default_stream = torch.cuda.current_stream()
+            # Fork: side stream picks up topk_ids / topk_weights / working_hidden
+            # which were just written on the default stream.
+            self.moe_side_stream.wait_stream(default_stream)
+            with torch.cuda.stream(self.moe_side_stream):
+                experts_output = self.fused_moe(
+                    hidden_states=working_hidden,
+                    topk_weights=topk_weights,
+                    topk_ids=topk_ids,
+                    activation="SiGLU",
+                )
+                if padded > 0:
+                    experts_output = experts_output[dp_offset : dp_offset + local_n]
+
+            # Default stream runs the shared expert in parallel.
+            shared_expert_output = self.shared_expert(hidden_states)
+            if self.shared_expert_gate is not None:
+                gate_output = self.shared_expert_gate(hidden_states)  # [T, 1]
+
+            # Join: default stream waits for routed MoE before mixing.
+            default_stream.wait_stream(self.moe_side_stream)
+            if self.shared_expert_gate is not None:
+                self.sigmoid_gate_scale_add(
+                    gate_output, shared_expert_output, experts_output
+                )
+            else:
+                experts_output = experts_output + shared_expert_output
+            return experts_output
+
+        # No shared expert — single-stream original path.
         experts_output = self.fused_moe(
             hidden_states=working_hidden,
             topk_weights=topk_weights,
             topk_ids=topk_ids,
             activation="SiGLU",
         )
-        # External gather path: router returned the full global output; slice
-        # back to this rank's DP shard before mixing in the shared expert
-        # (which runs on the original local input).
         if padded > 0:
             experts_output = experts_output[dp_offset : dp_offset + local_n]
-        if self.shared_expert is not None:
-            shared_expert_output = self.shared_expert(hidden_states)
-            if self.shared_expert_gate is not None:
-                gate_output = self.shared_expert_gate(hidden_states)  # [T, 1]
-                # Fused: experts_output += sigmoid(gate_output) * shared_expert_output
-                self.sigmoid_gate_scale_add(
-                    gate_output, shared_expert_output, experts_output
-                )
-            else:
-                experts_output = experts_output + shared_expert_output
         return experts_output
 
 

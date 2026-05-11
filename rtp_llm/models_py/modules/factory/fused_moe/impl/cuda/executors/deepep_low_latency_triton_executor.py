@@ -32,6 +32,7 @@ from rtp_llm.models_py.modules.factory.fused_moe.defs.quant_config import (
     FusedMoEQuantConfig,
 )
 from rtp_llm.models_py.modules.factory.fused_moe.defs.type import ExecutorType
+from rtp_llm.models_py.triton_kernels.moe.deepep_moe_align import deepep_moe_align
 from rtp_llm.models_py.triton_kernels.moe.fused_moe_triton import fused_experts_impl
 from rtp_llm.utils.model_weight import W
 
@@ -141,14 +142,65 @@ class DeepEPLowLatencyTritonExecutor(FusedMoeExpertExecutor):
             None  # (n_total, 1) fp32 ones
         )
         self._topk_ids_buf: Optional[torch.Tensor] = (
-            None  # (n_total,) int32 — kernel output
+            None  # (n_total,) int32 — _build_topk_ids output
         )
+        # Persistent output buffers for ``deepep_moe_align`` (the specialized
+        # moe_align fast-path). Sized to worst-case once ``e_local`` /
+        # ``max_recv`` are known. fused_moe_kernel only reads slots up to
+        # ``num_tokens_post_padded`` (early-return on the rest), so trailing
+        # uninitialized region is fine.
+        self._align_sorted_token_ids_buf: Optional[torch.Tensor] = (
+            None  # (max_pad_worst,) int32
+        )
+        self._align_expert_ids_buf: Optional[torch.Tensor] = (
+            None  # (max_num_blocks_worst,) int32
+        )
+        self._align_num_tokens_post_padded_buf: Optional[torch.Tensor] = (
+            None  # (1,) int32
+        )
+        # Persistent intermediate buffers for ``fused_experts_impl``.
+        # Pre-allocating these makes every per-layer ``execute()`` call
+        # alloc-free, which is the *only* way to make multi-stream MoE/
+        # shared-expert overlap work under CUDA Graph capture: a fresh
+        # ``torch.empty`` on a side stream during capture forces PyTorch's
+        # caching allocator to spin up a new private pool, doubling the
+        # graph's memory footprint and OOM-ing on tight configs.
+        self._intermediate_cache1_buf: Optional[torch.Tensor] = (
+            None  # (n_total, N_gateup) bf16
+        )
+        self._out_hidden_states_buf: Optional[torch.Tensor] = (
+            None  # (n_total, hidden) bf16
+        )
+        self._a2_q_3d_buf: Optional[torch.Tensor] = (
+            None  # (E_local, max_recv, H_half) fp8
+        )
+        self._a2_s_3d_buf: Optional[torch.Tensor] = (
+            None  # (E_local, max_recv, H_half // block_k) fp32
+        )
+
+    # ``BLOCK_SIZE_M`` for the FP8 W8A8 + per-block-quant path is hardcoded by
+    # ``try_get_optimal_moe_config``. The deepep_moe_align fast-path needs
+    # this value at executor init to size the output buffers, so we mirror it
+    # here. ``fused_experts_impl`` asserts at runtime that the value didn't
+    # drift.
+    _DEEPEP_FP8_BLOCK_SIZE_M = 64
+
+    # Class-level shared buffer pool. All MoE layers in the same model share
+    # the same physical buffers because at any point only one layer is doing
+    # forward — pre-allocating per-instance would waste ~200 MB × num_layers
+    # ≈ several GB. Keyed by (e_local, max_recv, hidden, n_gateup, dtype_tag,
+    # device_id) so a process hosting multiple models with different shapes
+    # still works.
+    _shared_buffers: Dict[tuple, Dict[str, torch.Tensor]] = {}
 
     def _ensure_routing_buffers(
         self, e_local: int, max_recv: int, device: torch.device
     ) -> None:
         """Lazily allocate routing scratch tensors. Constant across forwards
-        in low-latency mode (e_local, max_recv fixed)."""
+        in low-latency mode (e_local, max_recv fixed). Per-instance
+        templates (row_eid, row_pos, topk_weights, topk_ids_buf) are tiny —
+        keep per-layer. Heavy intermediate buffers are class-level shared
+        across all MoE layers (only one layer computes at a time)."""
         n_total = e_local * max_recv
         if (
             self._row_eid_template is not None
@@ -163,6 +215,70 @@ class DeepEPLowLatencyTritonExecutor(FusedMoeExpertExecutor):
             (n_total, 1), device=device, dtype=torch.float32
         )
         self._topk_ids_buf = torch.empty((n_total,), device=device, dtype=torch.int32)
+
+        # Heavy buffers shared across all MoE layers. These dominate memory:
+        # (intermediate_cache1 ≈ 128 MB, out_hidden_states ≈ 64 MB) × 40
+        # layers ≈ 8 GB if per-instance. Sharing collapses to ~200 MB total.
+        N_gateup = self.w13_weight.shape[1]
+        hidden = self.w13_weight.shape[2]
+        H_half = N_gateup // 2
+        bsm = self._DEEPEP_FP8_BLOCK_SIZE_M
+        block_k = self.block_shape[1] if self.block_shape is not None else 0
+        # Cache key: anything that affects buffer shape/dtype.
+        dtype_tag = "fp8_block" if (self.use_fp8_w8a8 and self.block_shape) else "other"
+        key = (
+            e_local,
+            max_recv,
+            hidden,
+            N_gateup,
+            bsm,
+            block_k,
+            dtype_tag,
+            device.type,
+            device.index,
+        )
+        bufs = type(self)._shared_buffers.get(key)
+        if bufs is None:
+            max_pad_worst = ((n_total + e_local * bsm + bsm - 1) // bsm) * bsm
+            max_num_blocks_worst = max_pad_worst // bsm
+            compute_dtype = torch.bfloat16
+            bufs = {
+                "align_sorted_token_ids": torch.empty(
+                    (max_pad_worst,), device=device, dtype=torch.int32
+                ),
+                "align_expert_ids": torch.empty(
+                    (max_num_blocks_worst,), device=device, dtype=torch.int32
+                ),
+                "align_num_tokens_post_padded": torch.empty(
+                    (1,), device=device, dtype=torch.int32
+                ),
+                "intermediate_cache1": torch.empty(
+                    (n_total, N_gateup), device=device, dtype=compute_dtype
+                ),
+                "out_hidden_states": torch.empty(
+                    (n_total, hidden), device=device, dtype=compute_dtype
+                ),
+            }
+            if self.use_fp8_w8a8 and self.block_shape is not None:
+                bufs["a2_q_3d"] = torch.empty(
+                    (e_local, max_recv, H_half),
+                    device=device,
+                    dtype=torch.float8_e4m3fn,
+                )
+                bufs["a2_s_3d"] = torch.empty(
+                    (e_local, max_recv, H_half // block_k),
+                    device=device,
+                    dtype=torch.float32,
+                )
+            type(self)._shared_buffers[key] = bufs
+
+        self._align_sorted_token_ids_buf = bufs["align_sorted_token_ids"]
+        self._align_expert_ids_buf = bufs["align_expert_ids"]
+        self._align_num_tokens_post_padded_buf = bufs["align_num_tokens_post_padded"]
+        self._intermediate_cache1_buf = bufs["intermediate_cache1"]
+        self._out_hidden_states_buf = bufs["out_hidden_states"]
+        self._a2_q_3d_buf = bufs.get("a2_q_3d")
+        self._a2_s_3d_buf = bufs.get("a2_s_3d")
 
     def execute(
         self,
@@ -217,14 +333,29 @@ class DeepEPLowLatencyTritonExecutor(FusedMoeExpertExecutor):
         topk_ids = self._topk_ids_buf.unsqueeze(1)
         topk_weights = self._topk_weights_template
 
+        # Specialized moe_align fast-path: 2 small kernels + persistent output
+        # buffers, replacing the generic ``moe_align_block_size`` (4 kernels +
+        # 4 scratch fills + per-call torch.zeros/full). Preserves the
+        # sparsity-prune semantics — ``num_tokens_post_padded`` is the actual
+        # padded sum of ``masked_m``, so fused_moe_kernel's grid stays compact.
+        deepep_moe_align(
+            masked_m=expert_num_tokens,
+            e_local=e_local,
+            max_recv=max_recv,
+            block_size_m=self._DEEPEP_FP8_BLOCK_SIZE_M,
+            sorted_token_ids=self._align_sorted_token_ids_buf,
+            expert_ids=self._align_expert_ids_buf,
+            num_tokens_post_padded=self._align_num_tokens_post_padded_buf,
+        )
+
         # DeepEP combine re-applies the *real* topk_weights on the recv side,
         # so here we want raw expert outputs — pass topk_weights = 1 and
         # apply_router_weight_on_input = False.
         out_dtype = payload.expert_x_origin_dtype or torch.bfloat16
-        # Zero-copy: when the router pre-allocated a NVSHMEM-backed output
-        # buffer, write the expert outputs straight into it (flat view) so
-        # ``low_latency_combine(zero_copy=True)`` can reduce in-place without
-        # the upfront ``memcpy128`` staging.
+        # Output buffer selection:
+        #   1. NVSHMEM zero-copy combine buffer (when router supplies it)
+        #   2. Otherwise: executor's pre-allocated ``_out_hidden_states_buf``,
+        #      so fused_experts_impl never needs to ``torch.empty`` per call.
         out_hidden_states_buf: Optional[torch.Tensor] = None
         if payload.output_buffer is not None:
             assert payload.output_buffer.shape == (e_local, max_recv, hidden), (
@@ -232,6 +363,8 @@ class DeepEPLowLatencyTritonExecutor(FusedMoeExpertExecutor):
                 f"({e_local}, {max_recv}, {hidden})"
             )
             out_hidden_states_buf = payload.output_buffer.view(n_total, hidden)
+        else:
+            out_hidden_states_buf = self._out_hidden_states_buf
 
         # Pass DeepEP layout metadata so fused_experts_impl can use the masked
         # 3D silu+mul+per-block-quant kernel (~28× cheaper than the per-row
@@ -266,6 +399,16 @@ class DeepEPLowLatencyTritonExecutor(FusedMoeExpertExecutor):
             e_local=e_local,
             max_recv=max_recv,
             expected_m=expected_m,
+            # Pre-computed by deepep_moe_align above — tells
+            # fused_experts_impl to skip the generic moe_align.
+            sorted_token_ids=self._align_sorted_token_ids_buf,
+            expert_ids=self._align_expert_ids_buf,
+            num_tokens_post_padded=self._align_num_tokens_post_padded_buf,
+            # Pre-allocated heavy intermediate buffers — keeps
+            # fused_experts_impl alloc-free under capture.
+            intermediate_cache1=self._intermediate_cache1_buf,
+            a2_q_3d=self._a2_q_3d_buf,
+            a2_s_3d=self._a2_s_3d_buf,
         )
 
         # When zero-copy is on the fused_moe write went straight into the
