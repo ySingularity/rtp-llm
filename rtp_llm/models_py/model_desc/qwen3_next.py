@@ -20,6 +20,7 @@ from rtp_llm.models_py.modules import (
     LinearFactory,
     MultimodalEmbeddingInjector,
     RMSNorm,
+    RMSResNorm,
 )
 from rtp_llm.models_py.triton_kernels.causal_conv1d import (
     CausalConv1dMetadata,
