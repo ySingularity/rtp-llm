@@ -20,6 +20,7 @@ from rtp_llm.models_py.modules import (
     LinearFactory,
     MultimodalEmbeddingInjector,
     RMSNorm,
+    RMSResNorm,
 )
 from rtp_llm.models_py.triton_kernels.causal_conv1d import (
     CausalConv1dMetadata,
@@ -41,6 +42,7 @@ from rtp_llm.models_py.utils.debug import cudagraph_debug_kernel
 from rtp_llm.models_py.utils.typed_storage_view import LinearCacheConverter
 from rtp_llm.ops import (
     AttentionConfigs,
+    HWKernelConfig,
     HybridAttentionType,
     LinearAttentionConfig,
     ParallelismConfig,
@@ -54,7 +56,6 @@ from rtp_llm.ops.compute_ops import (
 from rtp_llm.utils.model_weight import W
 from rtp_llm.utils.util import to_torch_dtype
 
-from rtp_llm.ops import HWKernelConfig
 
 class Qwen3NextMetadata(object):
     def __init__(
