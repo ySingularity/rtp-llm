@@ -178,6 +178,24 @@ class DeepEPLowLatencyTritonExecutor(FusedMoeExpertExecutor):
             None  # (E_local, max_recv, H_half // block_k) fp32
         )
 
+        # Eagerly allocate the heavy shared buffers HERE, while we're still
+        # in the regular (non-capture) caching-allocator pool. Otherwise
+        # first-touch happens during ``execute()`` — and if ``--warm_up 0``
+        # the first execute is inside CUDA Graph capture, where these large
+        # allocations land in a fixed-size private pool and OOM under tight
+        # configs (large model + many capture batch sizes + KV cache).
+        # ``max_recv`` is derivable from config without needing a dispatch.
+        try:
+            from rtp_llm.models_py.distributed.deepep_wrapper import DeepepWrapperConfig
+
+            max_recv = DeepepWrapperConfig.calc_low_latency_max_token_per_rank(
+                config.ll_num_max_token, config.tp_size, config.quant_config
+            )
+            device = self.w13_weight.device
+            self._ensure_routing_buffers(self.num_local_experts, max_recv, device)
+        except Exception:  # noqa: BLE001 — best-effort; falls back to lazy init
+            pass
+
     # ``BLOCK_SIZE_M`` for the FP8 W8A8 + per-block-quant path is hardcoded by
     # ``try_get_optimal_moe_config``. The deepep_moe_align fast-path needs
     # this value at executor init to size the output buffers, so we mirror it
