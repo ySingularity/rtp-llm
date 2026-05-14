@@ -1,4 +1,5 @@
 import functools
+import os
 from contextlib import contextmanager
 from typing import Any, Callable, Generator, List, NoReturn, Optional, Tuple
 
@@ -56,6 +57,8 @@ def has_deep_gemm() -> bool:
 
 @functools.cache
 def is_deep_gemm_e8m0_used() -> bool:
+    if os.environ.get("RTP_LLM_FORCE_NO_E8M0", "0") == "1":
+        return False
     return torch.cuda.get_device_capability()[0] in [10, 12]
 
 

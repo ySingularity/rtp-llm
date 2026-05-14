@@ -453,11 +453,9 @@ class Qwen3NextAttention(CausalAttention):
             quant_config,
             hw_kernel_config=hw_kernel_config,
         )
-        # Fuse the gate GEMM into the qkv GEMM (one linear with output
-        # [qkv | gate] that we slice in forward). Mirrors sglang's
-        # `attn_output_gate` packing in qwen3_5.
         self._qkv_size = self.q_size + 2 * (attn_config.kv_head_num * self.head_dim)
         self._gate_size = self.q_size
+
         fused_weight, fused_scales = self._build_fused_qkv_gate_weights(weights)
         self.qkv_proj = LinearFactory.create_linear(
             weight=fused_weight,
@@ -470,47 +468,42 @@ class Qwen3NextAttention(CausalAttention):
     def _build_fused_qkv_gate_weights(
         weights: Dict[str, torch.Tensor],
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        from rtp_llm.models_py.kernels.cuda.deepgemm_wrapper import (
+            is_deep_gemm_e8m0_used,
+        )
+
         qkv_w = weights[W.attn_qkv_w]
         gate_w = weights[W.attn_gate_w]
-        fused_weight = Qwen3NextAttention._concat_along_n_axis(qkv_w, gate_w)
-        fused_scales: Optional[torch.Tensor] = None
-        qkv_s = weights.get(W.attn_qkv_s)
-        gate_s = weights.get(W.attn_gate_s)
-        if qkv_s is not None and gate_s is not None:
-            fused_scales = Qwen3NextAttention._concat_along_n_axis(qkv_s, gate_s)
+        if is_deep_gemm_e8m0_used():
+            # e8m0 layout: (N, K). Cat along dim=0 (N), then requant with
+            # ue8m0 power-of-2 scales + TMA-aligned packing.
+            from rtp_llm.models_py.kernels.cuda.fp8_kernel import requant_weight_ue8m0
+
+            N_a, K = qkv_w.shape
+            N_b, K_b = gate_w.shape
+            assert K == K_b, f"K dim mismatch: {K} vs {K_b}"
+            fused_weight = torch.cat([qkv_w, gate_w], dim=0).contiguous()
+            fused_scales: Optional[torch.Tensor] = None
+            qkv_s = weights.get(W.attn_qkv_s)
+            gate_s = weights.get(W.attn_gate_s)
+            if qkv_s is not None and gate_s is not None:
+                fused_scales = torch.cat([qkv_s, gate_s], dim=0).contiguous()
+            if fused_scales is not None:
+                fused_weight, fused_scales = requant_weight_ue8m0(
+                    fused_weight, fused_scales
+                )
+        else:
+            # Non-e8m0 layout: (K, N). Cat along dim=1 (N).
+            K, N_a = qkv_w.shape
+            K_b, N_b = gate_w.shape
+            assert K == K_b, f"K dim mismatch: {K} vs {K_b}"
+            fused_weight = torch.cat([qkv_w, gate_w], dim=1).contiguous()
+            fused_scales = None
+            qkv_s = weights.get(W.attn_qkv_s)
+            gate_s = weights.get(W.attn_gate_s)
+            if qkv_s is not None and gate_s is not None:
+                fused_scales = torch.cat([qkv_s, gate_s], dim=1).contiguous()
         return fused_weight, fused_scales
-
-    @staticmethod
-    def _concat_along_n_axis(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-        """Concat two attention projection tensors along the output (N) axis.
-
-        BF16 weights from `merge_qkv_hf` are stored as (K, N) row-major in
-        memory, so plain `torch.cat(dim=1)` is a real column-wise concat.
-
-        FP8 per-block weights/scales come from `merge_te_qkv` /
-        `merge_block_scale` which concat along dim=0, giving real (N, K)
-        row-major memory; the per-block FP8 postprocess then reshapes the
-        SHAPE to (K, N) without touching the data. To fuse correctly we have
-        to view in the actual (N, K) memory layout, concat along the N axis
-        (dim=0), then reshape the SHAPE back to (K, N_total) so downstream
-        code keeps working.
-        """
-        K, N_a = a.shape
-        K_b, N_b = b.shape
-        assert K == K_b, f"K dim mismatch: {K} vs {K_b}"
-        # FP8 weight (e4m3) and FP8 per-block scale (float32 with the same
-        # postprocess reshape) live in (N, K) memory; everything else lives
-        # in (K, N) memory.
-        if a.dtype in (
-            torch.float8_e4m3fn,
-            torch.float8_e4m3fnuz,
-            torch.float32,
-        ):
-            a_real = a.reshape(N_a, K)
-            b_real = b.reshape(N_b, K)
-            fused_real = torch.cat([a_real, b_real], dim=0).contiguous()
-            return fused_real.reshape(K, N_a + N_b)
-        return torch.cat([a, b], dim=1).contiguous()
 
     def forward(
         self,
@@ -522,10 +515,6 @@ class Qwen3NextAttention(CausalAttention):
     ) -> torch.Tensor:
         input_shape = hidden_states.shape[:-1]
         fused = self.qkv_proj(hidden_states)
-        # Split into qkv (used by attention) and gate (sigmoid mask on
-        # attention output). Slices along the last dim are non-contiguous
-        # views; we materialize them since downstream kernels expect
-        # contiguous tensors.
         qkv = fused[..., : self._qkv_size].contiguous()
         gate = fused[..., self._qkv_size :].contiguous()
         if self.qk_fuse_norm is not None:
@@ -720,7 +709,7 @@ class Qwen3NextDecoderLayer(nn.Module):
         # (model_desc/generic_moe.py:243-266): the previous layer's residual_add
         # is folded into this layer's RMSResNorm, and the trailing residual_add
         # is deferred to the next layer (or final_norm in the last layer).
-        hidden_states = self.input_layernorm(hidden_states, residual)
+        hidden_states, residual = self.input_layernorm(hidden_states, residual)
         hidden_states = self.self_attn(
             hidden_states=hidden_states,
             fmha_impl=fmha_impl,
@@ -728,7 +717,7 @@ class Qwen3NextDecoderLayer(nn.Module):
             attention_inputs=attention_inputs,
             attn_meta=attn_meta,
         )
-        hidden_states = self.post_attention_layernorm(hidden_states, residual)
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
 
@@ -824,7 +813,7 @@ class Qwen3NextModel(GptModelBase):
             )
 
         # Final RMSResNorm absorbs the trailing residual_add the layers deferred.
-        hidden_states = self.norm(hidden_states, residual)
+        hidden_states, _ = self.norm(hidden_states, residual)
         return PyModelOutputs(hidden_states, fmha_impl.fmha_params)
 
 
