@@ -30,6 +30,19 @@ from rtp_llm.ops import HWKernelConfig, MoeConfig, ParallelismConfig
 from rtp_llm.ops.compute_ops import LayerKVCache, PyModelInputs, PyModelOutputs
 from rtp_llm.utils.model_weight import W
 
+try:
+    from rtp_llm.models_py.modules.factory.linear.impl.cuda.fp8_gemm_linear import (
+        CudaFp8GEMMLinear,
+    )
+    from rtp_llm.models_py.triton_kernels.common.fused_add_rmsnorm_fp8_quant import (
+        fused_add_rmsnorm_fp8_quant,
+        fused_add_rmsnorm_fp8_quant_with_bf16_output,
+    )
+except ImportError:
+    CudaFp8GEMMLinear = None
+    fused_add_rmsnorm_fp8_quant = None
+    fused_add_rmsnorm_fp8_quant_with_bf16_output = None
+
 
 class GenericMoeLayer(nn.Module):
     """Generic MoE layer supporting both Qwen3 and internal model."""
@@ -172,7 +185,12 @@ class GenericMoeLayer(nn.Module):
         global_hidden = all_reduce(global_hidden, group=Group.DP)
         return global_hidden, local_n, offset, padded
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        x_fp8: "Optional[torch.Tensor]" = None,
+        x_scale: "Optional[torch.Tensor]" = None,
+    ) -> torch.Tensor:
         # External DP gather (only triggered when the router requests it and
         # dp_size > 1). Falls through to the existing local-only path
         # otherwise, so single-GPU / pure-TP / pure-DP routers are unaffected.
@@ -253,7 +271,9 @@ class GenericMoeLayer(nn.Module):
             )
             if padded > 0:
                 experts_output = experts_output[dp_offset : dp_offset + local_n]
-            shared_expert_output = self.shared_expert(hidden_states)
+            shared_expert_output = self.shared_expert(
+                hidden_states, x_fp8=x_fp8, x_scale=x_scale
+            )
             if self.shared_expert_gate is not None:
                 gate_output = self.shared_expert_gate(hidden_states)
                 self.sigmoid_gate_scale_add(
@@ -285,7 +305,7 @@ class GenericMoeLayer(nn.Module):
 
         # Main stream: shared expert
         shared_expert_output = self.shared_expert(
-            hidden_states, skip_allreduce=skip_allreduce
+            hidden_states, x_fp8=x_fp8, x_scale=x_scale, skip_allreduce=skip_allreduce
         )
         if self.shared_expert_gate is not None:
             gate_output = self.shared_expert_gate(hidden_states)
