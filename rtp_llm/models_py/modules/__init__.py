@@ -20,6 +20,7 @@ from rtp_llm.models_py.modules.base import (
     RMSResNormTorch,
     SelectTopk,
     SigmoidGateScaleAdd,
+    SigmoidMulInplace,
     WriteCacheStoreOp,
 )
 
@@ -68,4 +69,5 @@ __all__ = [
     # Multimodal modules
     "MultimodalDeepstackInjector",
     "MultimodalEmbeddingInjector",
+    "SigmoidMulInplace",
 ]

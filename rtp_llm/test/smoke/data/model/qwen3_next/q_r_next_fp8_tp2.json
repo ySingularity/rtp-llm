@@ -26,12 +26,8 @@
                         "index": 0,
                         "message": {
                             "role": "assistant",
-                            "content": "嗯，用户问“你是谁”，这是一个很基础的问题。我需要先确认自己的身份。我是 Qwen3.5，阿里巴巴最新推出的通义千问大语言模型。我应该简明扼要地介绍自己，同时突出关键升级点，但避免过于技术化的术语。\n\n用户可能想了解我的能力，所以需要提到主要功能，比如多语言支持、逻辑推理、代码生成等。但要注意不要罗列太多细节，保持回答简洁。另外，用户可能没有明确说明使用",
-                            "reasoning_content": null,
-                            "function_call": null,
-                            "tool_calls": null,
-                            "partial": false,
-                            "tool_call_id": null
+                            "content": "Here's a thinking process that leads to the suggested questions about English listening methods:\n\n1.  **Analyze the Request:**\n    *   **Topic:** English Listening Methods (英语听力方法).\n    *   **Task:** Propose several questions (提出几个问题).\n    *   **Language:** The user asked in Chinese, so the output should be in Chinese (with English terms where appropriate).\n    *   **Goal:** The questions should be thought-provoking,",
+                            "partial": false
                         },
                         "finish_reason": "length",
                         "logprobs": null

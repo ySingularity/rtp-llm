@@ -7,6 +7,7 @@ from torch import nn
 
 import rtp_llm.ops.compute_ops as compute_ops
 from rtp_llm.config.model_config import ModelConfig
+from rtp_llm.device.device_type import DeviceType, get_device_type
 from rtp_llm.model_loader.model_weight_info import ModelWeights
 from rtp_llm.models_py.distributed.collective_torch import Group, all_reduce
 from rtp_llm.models_py.model_desc.block_map import select_block_map_for_layer
@@ -22,6 +23,25 @@ from rtp_llm.models_py.modules import (
     RMSNorm,
     RMSResNorm,
 )
+
+_DEVICE_TYPE = get_device_type()
+if _DEVICE_TYPE == DeviceType.Cuda:
+    from rtp_llm.models_py.modules.factory.linear.impl.cuda.fp8_gemm_linear import (
+        CudaFp8GEMMLinear,
+    )
+    from rtp_llm.models_py.triton_kernels.common.fused_add_rmsnorm_fp8_quant import (
+        fused_add_rmsnorm_fp8_quant,
+        fused_add_rmsnorm_fp8_quant_with_bf16_output,
+    )
+    from rtp_llm.models_py.triton_kernels.common.fused_rmsnorm_gated_fp8_quant import (
+        fused_rmsnorm_gated_fp8_quant,
+    )
+else:
+    CudaFp8GEMMLinear = None  # type: ignore
+    fused_add_rmsnorm_fp8_quant = None  # type: ignore
+    fused_add_rmsnorm_fp8_quant_with_bf16_output = None  # type: ignore
+    fused_rmsnorm_gated_fp8_quant = None  # type: ignore
+from rtp_llm.models_py.modules.base.common.kvcache_store import WriteCacheStoreOp
 from rtp_llm.models_py.triton_kernels.causal_conv1d import (
     CausalConv1dMetadata,
     causal_conv1d_fn,
@@ -559,24 +579,17 @@ class Qwen3NextAttention(CausalAttention):
         kv_cache: Optional[LayerKVCache],
         attention_inputs: Optional[PyAttentionInputs],
         attn_meta: Qwen3NextMetadata = Qwen3NextMetadata(),
+        x_fp8: Optional[torch.Tensor] = None,
+        x_scale: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        input_shape = hidden_states.shape[:-1]
-        if self._fused_qkv_gate:
-            fused = self.qkv_proj(hidden_states)
-            qkv = fused[..., : self._qkv_size].contiguous()
-            gate = fused[..., self._qkv_size :].contiguous()
+        if x_fp8 is not None and x_scale is not None:
+            gate = self.gate(x_fp8, input_scales=x_scale)
         else:
-            qkv = self.qkv_proj(hidden_states)
-            gate = self.gate_proj(hidden_states)
-        if self.qk_fuse_norm is not None:
-            qkv = self.qk_fuse_norm(qkv)
-        attn_output = fmha_impl.forward(qkv, kv_cache, self.layer_idx)
-        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
-        attn_output = attn_output.mul_(gate.sigmoid_())
-        output = self.o_proj(attn_output)
-        if self.tp_size > 1:
-            output = all_reduce(output, group=Group.TP)
-        return output
+            gate = self.gate(hidden_states)
+        attn_out = super().forward(
+            hidden_states, fmha_impl, kv_cache, gate, x_fp8=x_fp8, x_scale=x_scale
+        )
+        return attn_out
 
 
 class Qwen3NextGatedDeltaNet(nn.Module):
@@ -626,6 +639,16 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             weights, W.linear_attn_out_w, W.linear_attn_out_s, None, quant_config
         )
 
+        self._fuse_norm_quant = (
+            fused_rmsnorm_gated_fp8_quant is not None
+            and CudaFp8GEMMLinear is not None
+            and isinstance(self.out_proj, CudaFp8GEMMLinear)
+            and self.head_v_dim % 128 == 0
+        )
+        if self._fuse_norm_quant and self.out_proj.scale_ue8m0:
+            total_groups = self.local_num_v_heads * (self.head_v_dim // 128)
+            self._fuse_norm_quant = total_groups % 4 == 0
+
     # mixed_qkvz, mixed_ba -> q, k, v, z, b, a
     def fix_query_key_value_ordering(
         self, mixed_qkvz: torch.Tensor, mixed_ba: torch.Tensor
@@ -650,6 +673,164 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         # b,a should be contiguous for fused_gdn_gating
         return mixed_qkv, z, b, a
 
+    # TODO: extract shared conv1d/FLA/ssm-state logic with Qwen3NextGatedDeltaNetPrefill
+    # to eliminate duplication
+    def _forward_cp_prefill(
+        self,
+        mixed_qkv: torch.Tensor,
+        z: torch.Tensor,
+        b: torch.Tensor,
+        a: torch.Tensor,
+        attention_inputs: PyAttentionInputs,
+        kv_cache: Optional[LayerKVCache],
+        attn_meta: Qwen3NextMetadata,
+    ) -> torch.Tensor:
+        """CP prefill path: all-gather projected states, compute on full sequence,
+        extract local zigzag tokens."""
+        cp_info = attention_inputs.context_parallel_info
+
+        packed = torch.cat([mixed_qkv, b, a], dim=-1)
+        full_packed = all_gather(packed, group=Group.TP)
+
+        padding_mask = cp_info.prefill_qkv_padding_mask
+        restore_indices = cp_info.prefill_qkv_restore_indice
+        unpad_restore = restore_indices[padding_mask == 1]
+        full_packed = full_packed[unpad_restore]
+
+        qkv_dim = mixed_qkv.shape[-1]
+        b_dim = b.shape[-1]
+        full_mixed_qkv = full_packed[:, :qkv_dim].contiguous()
+        full_b = full_packed[:, qkv_dim : qkv_dim + b_dim].contiguous()
+        full_a = full_packed[:, qkv_dim + b_dim :].contiguous()
+
+        gdn = self.prefill_gdn
+        full_cu = attn_meta.full_prefill_cu_seqlens
+        full_conv_meta = attn_meta.full_prefill_conv1d_meta
+
+        kv_cache_tensor: Optional[torch.Tensor] = None
+        seq_size_per_block = 1
+        if kv_cache is not None:
+            kv_cache_tensor = kv_cache.kv_cache_base.reshape(
+                kv_cache.kv_cache_base.shape[0], -1
+            )
+            seq_size_per_block = kv_cache.seq_size_per_block
+
+        conv_states = (
+            gdn._get_conv_states(kv_cache_tensor).transpose(1, 2)
+            if kv_cache_tensor is not None
+            else None
+        )
+        full_mixed_qkv = causal_conv1d_fn(
+            x=full_mixed_qkv.transpose(0, 1),
+            weight=gdn.conv_weights,
+            bias=None,
+            conv_states=conv_states,
+            query_start_loc=full_cu,
+            block_map=attention_inputs.kv_cache_kernel_block_id_device,
+            seq_size_per_block=seq_size_per_block,
+            prefix_lengths=attention_inputs.prefix_lengths_d,
+            metadata=full_conv_meta,
+        ).transpose(0, 1)
+
+        g, beta = fused_gdn_gating(gdn.alog, full_a, full_b, gdn.dt_bias)
+        ssm_states = (
+            gdn._get_ssm_states(kv_cache_tensor)
+            if kv_cache_tensor is not None
+            else None
+        )
+        context_batch_size = attention_inputs.input_lengths.shape[0]
+        initial_states: Optional[torch.Tensor] = None
+        if ssm_states is not None:
+            initial_states = torch.empty(
+                context_batch_size,
+                gdn.local_num_v_heads,
+                gdn.head_v_dim,
+                gdn.head_k_dim,
+                device=full_mixed_qkv.device,
+                dtype=gdn.ssm_state_dtype,
+            )
+            load_initial_state_from_block_map(
+                attention_inputs.prefix_lengths_d,
+                attention_inputs.kv_cache_kernel_block_id_device,
+                ssm_states,
+                initial_states,
+                seq_size_per_block,
+            )
+
+        query, key, value = torch.split(
+            full_mixed_qkv,
+            [
+                gdn.local_num_k_heads * gdn.head_k_dim,
+                gdn.local_num_k_heads * gdn.head_k_dim,
+                gdn.local_num_v_heads * gdn.head_v_dim,
+            ],
+            dim=-1,
+        )
+        query = query.view(1, -1, gdn.local_num_k_heads, gdn.head_k_dim)
+        key = key.view(1, -1, gdn.local_num_k_heads, gdn.head_k_dim)
+        value = value.view(1, -1, gdn.local_num_v_heads, gdn.head_v_dim)
+
+        attn_out, h, final_state = chunk_gated_delta_rule(
+            query,
+            key,
+            value,
+            g,
+            beta,
+            initial_state=initial_states,
+            output_final_state=True,
+            cu_seqlens=full_cu,
+            use_qk_l2norm_in_kernel=True,
+        )
+
+        if ssm_states is not None:
+            store_ssm_state_to_block_map(
+                h,
+                final_state,
+                attention_inputs.prefix_lengths_d,
+                full_cu,
+                attention_inputs.kv_cache_kernel_block_id_device,
+                ssm_states,
+                seq_size_per_block,
+                chunk_size=64,
+            )
+
+        if kv_cache is not None and attn_meta.cp_write_cache_store_impl is not None:
+            attn_meta.cp_write_cache_store_impl(kv_cache)
+
+        full_attn_out = attn_out.squeeze_(0)
+
+        n_local = z.shape[0]
+        local_attn_out = torch.zeros(
+            n_local,
+            *full_attn_out.shape[1:],
+            device=full_attn_out.device,
+            dtype=full_attn_out.dtype,
+        )
+        valid_mask = attn_meta.cp_local_valid_mask
+        local_attn_out[valid_mask] = full_attn_out[attn_meta.cp_local_extract_indices]
+
+        if self._fuse_norm_quant and local_attn_out.dim() >= 2:
+            fp8_out, scale = fused_rmsnorm_gated_fp8_quant(
+                local_attn_out.reshape(-1, self.head_v_dim),
+                z,
+                self.norm.weight,
+                self.norm.eps,
+                num_heads=self.local_num_v_heads,
+                quant_group_size=128,
+                scale_ue8m0=self.out_proj.scale_ue8m0,
+            )
+            local_attn_out = self.out_proj(fp8_out, input_scales=scale)
+        else:
+            local_attn_out = self.norm(
+                local_attn_out.reshape(-1, self.head_v_dim),
+                z.reshape(-1, self.head_v_dim),
+            )
+            local_attn_out = local_attn_out.reshape(
+                -1, self.local_num_v_heads * self.head_v_dim
+            )
+            local_attn_out = self.out_proj(local_attn_out)
+        return local_attn_out
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -657,6 +838,8 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         kv_cache: Optional[LayerKVCache],
         attention_inputs: Optional[PyAttentionInputs],
         attn_meta: Qwen3NextMetadata,
+        x_fp8: Optional[torch.Tensor] = None,
+        x_scale: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         assert attention_inputs is not None, "attention_inputs is required"
         assert (
@@ -664,8 +847,13 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             or not attention_inputs.is_prefill
             or attn_meta.get_prefill_conv1d_meta() is not None
         ), "prefill_conv1d_meta is required for prefill"
-        projected_states_qkvz = self.in_proj_qkvz(hidden_states)
-        projected_states_ba = self.in_proj_ba(hidden_states)
+        if x_fp8 is not None and x_scale is not None:
+            projected_states_qkvz = self.in_proj_qkvz(x_fp8, input_scales=x_scale)
+        else:
+            projected_states_qkvz = self.in_proj_qkvz(hidden_states)
+        projected_states_ba = self.in_proj_ba(
+            hidden_states
+        )  # fuse kernel: nvjet_tst_64x8_64x16_1x4_h_bz_TNT (bf16 nn.Linear, LINEAR layer only)
         mixed_qkv, z, b, a = self.fix_query_key_value_ordering(
             projected_states_qkvz, projected_states_ba
         )
@@ -677,12 +865,26 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             attn_output = self.decode_gdn(
                 mixed_qkv, b, a, attention_inputs, kv_cache, attn_meta
             )
-        attn_output = self.norm(
-            attn_output.reshape(-1, self.head_v_dim), z.reshape(-1, self.head_v_dim)
-        )
-        # from [token * head, dim] -> [token, head * dim]
-        attn_output = attn_output.reshape(-1, self.local_num_v_heads * self.head_v_dim)
-        attn_output = self.out_proj(attn_output)
+        if self._fuse_norm_quant and attn_output.dim() >= 2:
+            fp8_out, scale = fused_rmsnorm_gated_fp8_quant(
+                attn_output.reshape(-1, self.head_v_dim),
+                z,
+                self.norm.weight,
+                self.norm.eps,
+                num_heads=self.local_num_v_heads,
+                quant_group_size=128,
+                scale_ue8m0=self.out_proj.scale_ue8m0,
+            )
+            attn_output = self.out_proj(fp8_out, input_scales=scale)
+        else:
+            attn_output = self.norm(
+                attn_output.reshape(-1, self.head_v_dim),
+                z.reshape(-1, self.head_v_dim),
+            )
+            attn_output = attn_output.reshape(
+                -1, self.local_num_v_heads * self.head_v_dim
+            )
+            attn_output = self.out_proj(attn_output)
         if self.parallelism_config.get_attn_tp_size() > 1:
             attn_output = all_reduce(attn_output, group=Group.TP)
         return attn_output
@@ -738,14 +940,60 @@ class Qwen3NextDecoderLayer(nn.Module):
                 config.activation_type, parallelism_config, weights, config.quant_config
             )
 
-        # fuse residual_add into the layernorm. Same pattern as
-        # GenericMoeDecoderLayer (model_desc/generic_moe.py:236-241).
         self.input_layernorm = RMSResNorm(
             weights[W.pre_ln_gamma], eps=config.layernorm_eps
         )
         self.post_attention_layernorm = RMSResNorm(
             weights[W.post_ln_gamma], eps=config.layernorm_eps
         )
+
+        self._fuse_post_norm_quant = (
+            fused_add_rmsnorm_fp8_quant is not None
+            and isinstance(self.mlp, DenseMLP)
+            and self.mlp.accepts_fp8_input
+        )
+        self._fuse_post_norm_quant_moe = (
+            fused_add_rmsnorm_fp8_quant_with_bf16_output is not None
+            and isinstance(self.mlp, GenericMoeLayer)
+            and self.mlp.shared_expert is not None
+            and self.mlp.shared_expert.accepts_fp8_input
+        )
+
+        # Fuse input_layernorm + fp8 quant for ATTENTION layers: both gate
+        # and qkv_proj consume the same hidden_states, so quantize once and
+        # share the fp8+scale between them.
+        self._fuse_input_norm_quant = False
+        if (
+            fused_add_rmsnorm_fp8_quant is not None
+            and CudaFp8GEMMLinear is not None
+            and self.layer_type != HybridAttentionType.LINEAR
+            and isinstance(self.self_attn, Qwen3NextAttention)
+        ):
+            _gate = getattr(self.self_attn, "gate", None)
+            _qkv = getattr(self.self_attn, "qkv_proj", None)
+            if isinstance(_gate, CudaFp8GEMMLinear) and isinstance(
+                _qkv, CudaFp8GEMMLinear
+            ):
+                assert _gate.scale_ue8m0 == _qkv.scale_ue8m0, (
+                    f"gate.scale_ue8m0={_gate.scale_ue8m0} != "
+                    f"qkv_proj.scale_ue8m0={_qkv.scale_ue8m0}: "
+                    "shared fp8 scale requires identical format"
+                )
+                self._fuse_input_norm_quant = True
+
+        # Fuse input_layernorm + fp8 quant for LINEAR layers: in_proj_qkvz is
+        # fp8 but in_proj_ba is bf16, so use dual-output kernel that produces
+        # both bf16 normed and fp8+scale.
+        self._fuse_input_norm_quant_linear = False
+        if (
+            fused_add_rmsnorm_fp8_quant_with_bf16_output is not None
+            and CudaFp8GEMMLinear is not None
+            and self.layer_type == HybridAttentionType.LINEAR
+            and isinstance(self.self_attn, Qwen3NextGatedDeltaNet)
+        ):
+            _qkvz = getattr(self.self_attn, "in_proj_qkvz", None)
+            if isinstance(_qkvz, CudaFp8GEMMLinear):
+                self._fuse_input_norm_quant_linear = True
 
     def forward(
         self,
@@ -756,20 +1004,76 @@ class Qwen3NextDecoderLayer(nn.Module):
         attention_inputs: Optional[PyAttentionInputs] = None,
         attn_meta: Qwen3NextMetadata = Qwen3NextMetadata(),
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # Same residual-fusion pattern as GenericMoeDecoderLayer.forward
-        # (model_desc/generic_moe.py:243-266): the previous layer's residual_add
-        # is folded into this layer's RMSResNorm, and the trailing residual_add
-        # is deferred to the next layer (or final_norm in the last layer).
-        hidden_states, residual = self.input_layernorm(hidden_states, residual)
-        hidden_states = self.self_attn(
-            hidden_states=hidden_states,
-            fmha_impl=fmha_impl,
-            kv_cache=kv_cache,
-            attention_inputs=attention_inputs,
-            attn_meta=attn_meta,
-        )
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        hidden_states = self.mlp(hidden_states)
+        if self._fuse_input_norm_quant and hidden_states.dim() == 2:
+            fp8_hs, scale = fused_add_rmsnorm_fp8_quant(
+                hidden_states,
+                residual,
+                self.input_layernorm.weight.data,
+                self.input_layernorm.variance_epsilon,
+                group_size=128,
+                scale_ue8m0=self.self_attn.gate.scale_ue8m0,
+            )
+            hidden_states = self.self_attn(
+                hidden_states=hidden_states,
+                fmha_impl=fmha_impl,
+                kv_cache=kv_cache,
+                attention_inputs=attention_inputs,
+                attn_meta=attn_meta,
+                x_fp8=fp8_hs,
+                x_scale=scale,
+            )
+        elif self._fuse_input_norm_quant_linear and hidden_states.dim() == 2:
+            bf16_hs, fp8_hs, scale = fused_add_rmsnorm_fp8_quant_with_bf16_output(
+                hidden_states,
+                residual,
+                self.input_layernorm.weight.data,
+                self.input_layernorm.variance_epsilon,
+                group_size=128,
+                scale_ue8m0=self.self_attn.in_proj_qkvz.scale_ue8m0,
+            )
+            hidden_states = self.self_attn(
+                hidden_states=bf16_hs,
+                fmha_impl=fmha_impl,
+                kv_cache=kv_cache,
+                attention_inputs=attention_inputs,
+                attn_meta=attn_meta,
+                x_fp8=fp8_hs,
+                x_scale=scale,
+            )
+        else:
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+            hidden_states = self.self_attn(
+                hidden_states=hidden_states,
+                fmha_impl=fmha_impl,
+                kv_cache=kv_cache,
+                attention_inputs=attention_inputs,
+                attn_meta=attn_meta,
+            )
+        if self._fuse_post_norm_quant and hidden_states.dim() == 2:
+            fp8_hs, scale = fused_add_rmsnorm_fp8_quant(
+                hidden_states,
+                residual,
+                self.post_attention_layernorm.weight.data,
+                self.post_attention_layernorm.variance_epsilon,
+                group_size=128,
+                scale_ue8m0=self.mlp.up_proj.scale_ue8m0,
+            )
+            hidden_states = self.mlp(hidden_states, x_fp8=fp8_hs, x_scale=scale)
+        elif self._fuse_post_norm_quant_moe and hidden_states.dim() == 2:
+            bf16_hs, fp8_hs, scale = fused_add_rmsnorm_fp8_quant_with_bf16_output(
+                hidden_states,
+                residual,
+                self.post_attention_layernorm.weight.data,
+                self.post_attention_layernorm.variance_epsilon,
+                group_size=128,
+                scale_ue8m0=self.mlp.shared_expert.up_proj.scale_ue8m0,
+            )
+            hidden_states = self.mlp(bf16_hs, x_fp8=fp8_hs, x_scale=scale)
+        else:
+            hidden_states, residual = self.post_attention_layernorm(
+                hidden_states, residual
+            )
+            hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
 
 
@@ -817,7 +1121,6 @@ class Qwen3NextModel(GptModelBase):
                 for idx in range(self.layer_num)
             ]
         )
-        # Final norm is RMSResNorm so it can absorb the very last layer's residual.
         self.norm = RMSResNorm(
             weights.get_global_weight(W.final_ln_gamma), eps=model_config.layernorm_eps
         )
@@ -828,6 +1131,22 @@ class Qwen3NextModel(GptModelBase):
 
     def forward(self, inputs: PyModelInputs, fmha_impl: Any = None) -> PyModelOutputs:
         hidden_states = self.word_embedding(inputs)
+
+        if fmha_impl is None:
+            fmha_impl = self.prepare_fmha_impl(inputs)
+
+        is_capturing = torch.cuda.is_current_stream_capturing()
+        if is_capturing:
+            self._cuda_graph_captured = True
+        if not getattr(self, "_cuda_graph_captured", False) and not is_capturing:
+            if not getattr(self, "_cublas_warmed", False):
+                self._cublas_warmed = True
+                self._warmup_cublas(hidden_states)
+                self._warmup_flashinfer_jit()
+            hidden_states = torch.zeros_like(hidden_states)
+            residual = torch.zeros_like(hidden_states)
+            hidden_states, _ = self.norm(hidden_states, residual)
+            return PyModelOutputs(hidden_states, fmha_impl.fmha_params)
 
         attention_inputs: PyAttentionInputs = inputs.attention_inputs
         prefill_conv1d_meta = None
@@ -841,16 +1160,12 @@ class Qwen3NextModel(GptModelBase):
 
         attn_meta = Qwen3NextMetadata(prefill_conv1d_meta, is_target_verify)
 
-        # qwen3_next model has only one full group (group 0): use fmha_impl from input param
-        # if there is a model with more than 1 full groups,
-        # we should prepare fmha_impl for each full group/ fix later
-
         if fmha_impl is None:
             fmha_impl = self.prepare_fmha_impl(inputs)
 
-        # Initialise residual to a fresh zero tensor (must be a distinct buffer
-        # from hidden_states because RMSResNorm mutates both in-place).
-        residual = torch.zeros_like(hidden_states)
+        residual = torch.zeros_like(
+            hidden_states
+        )  # fuse kernel: at::native::vectorized_elementwise_kernel<8, FillFunctor<c10::BFloat16>> (1 per iter)
         for i, decoder_layer in enumerate(self.layers):
             # Switch to correct block_map for this layer in hybrid attention mode
             select_block_map_for_layer(attention_inputs, i)
@@ -863,8 +1178,7 @@ class Qwen3NextModel(GptModelBase):
                 attn_meta=attn_meta,
             )
 
-        # Final RMSResNorm absorbs the trailing residual_add the layers deferred.
-        hidden_states, _ = self.norm(hidden_states, residual)
+        hidden_states, residual = self.norm(hidden_states, residual)
         return PyModelOutputs(hidden_states, fmha_impl.fmha_params)
 
 
