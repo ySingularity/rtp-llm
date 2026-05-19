@@ -264,6 +264,17 @@ class TritonFusedMoeExecutor(FusedMoeExpertExecutor):
         max_num_blocks = max_pad // block_size
         cap_n, cap_p = self._align_scratch_capacity
         if self._align_scratch is None or cap_n < num_valid_tokens or cap_p < max_pad:
+            # Allocate cum (int64 [E+1]) and slot_counter (int32 [E]) as
+            # views of a single contiguous byte buffer so one zero_() resets
+            # both — saves one FillFunctor kernel launch per MoE forward.
+            cum_bytes = (num_e + 1) * 8  # int64
+            slot_bytes = num_e * 4  # int32
+            cum_and_slot = torch.zeros(
+                cum_bytes + slot_bytes, dtype=torch.uint8, device=device
+            )
+            cum = cum_and_slot[:cum_bytes].view(torch.int64)
+            slot_counter = cum_and_slot[cum_bytes:].view(torch.int32)
+
             self._align_scratch = {
                 "bucket": torch.empty(
                     num_valid_tokens, dtype=torch.int64, device=device
@@ -271,8 +282,9 @@ class TritonFusedMoeExecutor(FusedMoeExpertExecutor):
                 "expert_count": torch.empty(
                     num_e + 1, dtype=torch.int64, device=device
                 ),
-                "cum": torch.empty(num_e + 1, dtype=torch.int64, device=device),
-                "slot_counter": torch.empty(num_e, dtype=torch.int32, device=device),
+                "cum": cum,
+                "slot_counter": slot_counter,
+                "cum_and_slot": cum_and_slot,
                 "sorted_ids": torch.empty(max_pad, dtype=torch.int32, device=device),
                 "expert_ids": torch.empty(
                     max_num_blocks, dtype=torch.int32, device=device

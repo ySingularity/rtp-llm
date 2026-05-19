@@ -143,6 +143,40 @@ def _moe_align_padcum_kernel(
 
 
 @triton.jit
+def _moe_align_padcum_and_expert_ids_kernel(
+    expert_count_ptr,  # int64 [E+1]; input
+    cum_ptr,  # int64 [E+1]; output, exclusive cumsum of padded counts
+    expert_ids_ptr,  # int32 [max_num_blocks]; output
+    block_size,  # i32, the BLOCK_SIZE_M for fused MoE
+    num_experts,  # i32
+    max_num_blocks,  # i32
+    BLOCK_E: tl.constexpr,  # power-of-two >= num_experts
+):
+    """Fused padcum + expert_ids in a single kernel launch.
+
+    Single program computes the padded exclusive cumsum of expert_count,
+    then iterates over all blocks to assign expert ownership.
+    """
+    if tl.program_id(0) != 0:
+        return
+    e = tl.arange(0, BLOCK_E)
+    in_range = e < num_experts
+    cnt = tl.load(expert_count_ptr + e, mask=in_range, other=0)
+    padded = ((cnt + block_size - 1) // block_size) * block_size
+    padded = tl.where(in_range, padded, 0)
+    inclusive = tl.cumsum(padded, axis=0)
+    # Write cum[1..E] = inclusive cumsum. cum[0] stays at 0 (pre-zeroed by caller).
+    tl.store(cum_ptr + 1 + e, inclusive, mask=in_range)
+
+    # Compute expert_ids for each block using the just-computed cum.
+    for bid in range(max_num_blocks):
+        block_start = bid * block_size
+        count_le = tl.sum(tl.where(inclusive <= block_start, 1, 0).to(tl.int32), axis=0)
+        expert_id = tl.where(count_le >= num_experts, -1, count_le)
+        tl.store(expert_ids_ptr + bid, expert_id.to(tl.int32))
+
+
+@triton.jit
 def _moe_align_expert_ids_kernel(
     cum_ptr,  # int64 [E+1]
     expert_ids_ptr,  # int32 [max_num_blocks]; output
@@ -162,12 +196,6 @@ def _moe_align_expert_ids_kernel(
     block_start = pid * block_size
     e = tl.arange(0, BLOCK_E)
     in_range = e < num_experts
-    # cum[1..E] are the right-edges of each expert's range. expert_id =
-    # smallest e such that block_start < cum[e+1]. Equivalently, count of
-    # experts whose cum[e+1] <= block_start.
-    # ``other=`` for masked-out lanes uses a sentinel large enough to be
-    # treated as "this expert lies past block_start" (i.e. NOT counted in
-    # ``count_le``). Triton's ``tl.load(other=)`` accepts plain Python ints.
     INT64_MAX_LIKE = 0x7FFFFFFFFFFFFFFF
     cum_vals = tl.load(cum_ptr + 1 + e, mask=in_range, other=INT64_MAX_LIKE)
     count_le = tl.sum(tl.where(cum_vals <= block_start, 1, 0).to(tl.int32), axis=0)
@@ -284,8 +312,9 @@ def moe_align_block_size(
             bucket = scratch["bucket"]
             expert_count = scratch["expert_count"]
             expert_count.zero_()
-        cum.zero_()
-        slot_counter.zero_()
+        # Single zero_() on the contiguous cum_and_slot buffer covers both
+        # cum (int64 [E+1]) and slot_counter (int32 [E]) in one kernel.
+        scratch["cum_and_slot"].zero_()
         sorted_ids.fill_(num_valid_tokens)
 
     # 1) Fused bucket + count Triton kernel (skipped when pre-computed).
@@ -305,17 +334,20 @@ def moe_align_block_size(
                 IDS_DTYPE=ids_dtype_flag,
             )
 
-    # 2) Single-block pad+cumsum Triton kernel (sequential within one CTA).
+    # 2) Fused padcum + expert_ids (single CTA computes cumsum then assigns
+    #    expert ownership per block — replaces 2 separate kernel launches).
     BLOCK_E = max(_next_pow2(num_experts), 16)
-    _moe_align_padcum_kernel[(1,)](
+    _moe_align_padcum_and_expert_ids_kernel[(1,)](
         expert_count,
         cum,
+        expert_ids,
         block_size,
         num_experts,
+        max_num_blocks,
         BLOCK_E=BLOCK_E,
     )
 
-    # 3) Existing one-pass scatter kernel (writes sorted_ids).
+    # 3) One-pass scatter kernel (writes sorted_ids).
     if num_valid_tokens > 0:
         grid_scatter = (triton.cdiv(num_valid_tokens, BLOCK),)
         _moe_align_scatter_kernel[grid_scatter](
@@ -327,16 +359,6 @@ def moe_align_block_size(
             num_experts,
             BLOCK_SIZE=BLOCK,
         )
-
-    # 4) Fused expert_ids Triton kernel (replaces arange+searchsorted+where+to).
-    _moe_align_expert_ids_kernel[(max_num_blocks,)](
-        cum,
-        expert_ids,
-        block_size,
-        num_experts,
-        max_num_blocks,
-        BLOCK_E=BLOCK_E,
-    )
 
     # Publish total_pad as a device-side int32 tensor so the kernel can read
     # it without a host sync. ``cum[-1]`` holds the inclusive cumsum total;
