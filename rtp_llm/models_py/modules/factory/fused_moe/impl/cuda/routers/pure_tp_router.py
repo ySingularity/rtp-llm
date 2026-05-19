@@ -26,6 +26,7 @@ from rtp_llm.models_py.modules.factory.fused_moe.utils.config_resolver import (
     MoeConfigResolver,
 )
 from rtp_llm.models_py.triton_kernels.moe.ep_kernels import (
+    recompute_topk_and_align_count,
     recompute_topk_ids_sum_expert_count,
 )
 from rtp_llm.ops.compute_ops import trt_fp8_quantize_128
@@ -108,7 +109,11 @@ class PureTpRouterBase(FusedMoeDataRouter):
             expert_x,
             a1.dtype,
             expert_x_scale,
-            ExpertTokensMetadata(None, num_recv_tokens_per_expert, None),
+            ExpertTokensMetadata(
+                None,
+                num_recv_tokens_per_expert,
+                None,
+            ),
             adjusted_topk_ids,
             topk_weights,
         )
@@ -358,7 +363,29 @@ class PureTpRouterFp8PerBlockTriton(PureTpRouterFp8PerBlock):
                 a1, topk_ids, topk_weights
             )
             self._dp_padded_size = padded
-        return super().prepare(a1, a1_scale, a2_scale, topk_weights, topk_ids)
+
+        assert a1_scale is None and a2_scale is None, "not support quanted moe"
+        expert_x, expert_x_scale = self._do_quant(a1)
+
+        adjusted_topk_ids, align_expert_count, align_bucket = (
+            recompute_topk_and_align_count(
+                topk_ids, self.expert_start_id, self.expert_num_per_rank
+            )
+        )
+        return ExpertForwardPayload(
+            expert_x,
+            a1.dtype,
+            expert_x_scale,
+            ExpertTokensMetadata(
+                None,
+                None,
+                None,
+                align_bucket=align_bucket,
+                align_expert_count=align_expert_count,
+            ),
+            adjusted_topk_ids,
+            topk_weights,
+        )
 
     def finalize(
         self,
@@ -367,6 +394,7 @@ class PureTpRouterFp8PerBlockTriton(PureTpRouterFp8PerBlock):
         topk_ids: torch.Tensor,
         apply_router_weight_on_input: bool,
         extra_finalize_args: Optional[dict[str, Any]],
+        skip_allreduce: bool = False,
     ) -> torch.Tensor:
         if not self._needs_dp_gather:
             return super().finalize(
@@ -375,6 +403,7 @@ class PureTpRouterFp8PerBlockTriton(PureTpRouterFp8PerBlock):
                 topk_ids,
                 apply_router_weight_on_input,
                 extra_finalize_args,
+                skip_allreduce=skip_allreduce,
             )
         # In the DP+EP path the parent finalize would not all_reduce because
         # tp_size == 1; do the EP-group all_reduce ourselves and slice back

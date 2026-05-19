@@ -150,6 +150,44 @@ cc_library(
 )
 
 cc_library(
+    name = "custom_all_reduce",
+    srcs = ["custom_all_reduce.cu"],
+    hdrs = [
+        "custom_all_reduce.cuh",
+        "custom_all_reduce.h",
+    ],
+    deps = [
+        "@local_config_cuda//cuda:cuda_headers",
+        "@local_config_cuda//cuda:cudart",
+    ] + torch_deps(),
+    copts = cuda_copts(),
+    visibility = ["//visibility:public"],
+    alwayslink = 1,
+)
+
+# Standalone MPI+NCCL benchmark binary for custom allreduce.
+# Build: bazel build //rtp_llm/models_py/bindings/cuda/kernels:custom_all_reduce_test --config=cuda12_9_arm
+# Run:   mpirun --allow-run-as-root -np 2 ./bazel-bin/.../custom_all_reduce_test
+cc_binary(
+    name = "custom_all_reduce_test",
+    srcs = [
+        "custom_all_reduce_test.cu",
+        "custom_all_reduce.cuh",
+    ],
+    deps = [
+        "@local_config_cuda//cuda:cuda_headers",
+        "@local_config_cuda//cuda:cudart",
+        "@local_config_cuda//cuda:curand",
+        "@local_config_cuda//cuda:curand_headers",
+        "@local_config_cuda//cuda:nccl",
+        "@local_config_cuda//cuda:nccl_headers",
+    ],
+    copts = cuda_copts(),
+    linkopts = ["-lmpi"],
+    tags = ["manual"],
+)
+
+cc_library(
     name = "user_buffers",
     srcs = ["user_buffer/user_buffers.cu"],
     hdrs = ["user_buffer/user_buffers.h"],

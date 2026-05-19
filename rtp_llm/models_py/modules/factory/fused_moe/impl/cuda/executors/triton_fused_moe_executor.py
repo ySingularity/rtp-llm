@@ -83,6 +83,19 @@ class TritonFusedMoeExecutor(FusedMoeExpertExecutor):
         self.w13_weight_scale = weights.get(W.moe_s1, None)
         self.w2_weight_scale = weights.get(W.moe_s2, None)
 
+        # On SM 10.x the weight loader converts per-block FP8 weights to
+        # UE8M0 format (both the fp8 values and scales are transformed).
+        # The Triton kernel expects standard per-block fp8 with row-major
+        # fp32 scales. Convert back at init time: dequant → bf16 → re-quant
+        # with standard per-block fp8.
+        if self.use_fp8_w8a8 and self.block_shape is not None:
+            from rtp_llm.models_py.kernels.cuda.deepgemm_wrapper import (
+                is_deep_gemm_e8m0_used,
+            )
+
+            if is_deep_gemm_e8m0_used():
+                self._convert_ue8m0_to_standard_fp8()
+
         # Filter sentinel-marked rows when EP is in use (some topk_ids may be -1
         # after PureTpRouter recompute).
         self.filter_expert = self.num_local_experts != self.num_experts
@@ -109,6 +122,128 @@ class TritonFusedMoeExecutor(FusedMoeExpertExecutor):
     def topk_ids_dtype(self) -> torch.dtype:
         return torch.int32
 
+    @staticmethod
+    def _unpack_ue8m0_packed_scales(
+        packed: torch.Tensor,
+        weight_rows: int,
+        weight_cols: int,
+        block_size: int = 128,
+    ) -> torch.Tensor:
+        """Reverse ``_transform_scale_ue8m0`` + ``get_mn_major_tma_aligned_packed_ue8m0_tensor``.
+
+        Args:
+            packed: int32 tensor ``(..., N, packed_k)`` from the weight
+                loader.  ``N`` = ``weight_rows``.
+            weight_rows: N dimension of the weight matrix.
+            weight_cols: K dimension of the weight matrix.
+            block_size: quantization block size (default 128).
+
+        Returns:
+            fp32 scale tensor ``(..., n_blocks, k_blocks)`` in row-major.
+        """
+        assert packed.dtype == torch.int32
+
+        batch_dims = packed.shape[:-2]
+        mn = packed.shape[-2]
+        packed_k = packed.shape[-1]
+
+        flat = packed.reshape(-1, mn, packed_k)
+        b = flat.shape[0]
+
+        # The packing stores data in column-major layout via a transpose.
+        # .contiguous() converts back to row-major. Flatten per-batch to
+        # allow the int32→uint8 dtype view, then reshape to unpack each
+        # int32 into 4 UE8M0 exponent bytes along k.
+        flat_bytes = (
+            flat.contiguous()
+            .reshape(b, -1)
+            .view(torch.uint8)
+            .reshape(b, mn, packed_k * 4)
+        )
+
+        # Convert UE8M0 uint8 exponents → fp32.
+        fp32_scales = (flat_bytes.to(torch.int32) << 23).view(torch.float32)
+
+        n_blocks = (weight_rows + block_size - 1) // block_size
+        k_blocks = (weight_cols + block_size - 1) // block_size
+
+        # Subsample every block_size rows and trim k padding.
+        block_scales = fp32_scales[:, ::block_size, :k_blocks]
+
+        return block_scales.reshape(*batch_dims, n_blocks, k_blocks).contiguous()
+
+    def _convert_ue8m0_to_standard_fp8(self) -> None:
+        """Convert UE8M0-format weights+scales to standard per-block FP8.
+
+        On SM 10.x, the weight loader transforms MoE weights via
+        ``requant_weight_ue8m0``: it dequantizes the original per-block FP8
+        weights to bf16, then re-quantizes with UE8M0-rounded scales, and
+        finally packs the scales into a column-major TMA-aligned int32
+        layout for DeepGemm consumption.
+
+        The Triton kernel needs standard per-block FP8 with row-major fp32
+        scales.  This method reverses the process at init time:
+        1. Unpack UE8M0 packed int32 scales → fp32 block-level scales
+        2. Dequant FP8 weights → bf16 using those scales
+        3. Re-quant bf16 → standard per-block FP8 with fp32 scales
+        """
+        import logging as _logging
+
+        _log = _logging.getLogger(__name__)
+        from rtp_llm.models_py.kernels.cuda.fp8_kernel import (
+            block_quant_dequant,
+            per_block_cast_to_fp8,
+        )
+
+        block_n, block_k = self.block_shape
+
+        for attr_w, attr_s, name in [
+            ("w13_weight", "w13_weight_scale", "w13"),
+            ("w2_weight", "w2_weight_scale", "w2"),
+        ]:
+            w = getattr(self, attr_w)
+            s = getattr(self, attr_s)
+            if w is None or s is None or s.dtype != torch.int32:
+                continue
+
+            E_local, N, K = w.shape
+
+            fp32_scales = self._unpack_ue8m0_packed_scales(s, N, K, block_n)
+
+            # Convert per-expert on CPU, write back in-place to avoid
+            # OOM on large MoE (397B, 128 experts/rank, 184GB GPU
+            # nearly full). Only scales need a new tensor (shape changes
+            # from packed int32 to fp32 block grid).
+            device = w.device
+            new_s_list = []
+            for e in range(E_local):
+                w_cpu = w[e].cpu()
+                s_cpu = fp32_scales[e].cpu()
+                bf16_cpu = block_quant_dequant(
+                    w_cpu.unsqueeze(0),
+                    s_cpu.unsqueeze(0),
+                    self.block_shape,
+                    torch.bfloat16,
+                ).squeeze(0)
+                del w_cpu, s_cpu
+                bf16_gpu = bf16_cpu.to(device)
+                del bf16_cpu
+                w_e, s_e = per_block_cast_to_fp8(bf16_gpu, use_ue8m0=False)
+                del bf16_gpu
+                w[e].copy_(w_e)
+                del w_e
+                new_s_list.append(s_e)
+
+            new_s = torch.stack(new_s_list)
+            _log.info(
+                "UE8M0→standard FP8 convert %s: %s(%s), scales %s",
+                name,
+                tuple(w.shape),
+                w.dtype,
+                tuple(new_s.shape),
+            )
+            setattr(self, attr_s, new_s)
+
     def _ensure_align_scratch(
         self,
         num_valid_tokens: int,
@@ -117,13 +252,14 @@ class TritonFusedMoeExecutor(FusedMoeExpertExecutor):
     ) -> Dict[str, torch.Tensor]:
         """Pre-allocate scratch buffers for moe_align_block_size.
 
-        The ``num_experts`` here is the *physical* expert count seen by the
-        Triton kernel (== ``self.num_experts`` for non-EP, or full E even
-        when EP-filtered, since ``moe_align`` operates on global topk_ids
-        before filtering). ``max_pad`` is computed identically to the
-        in-function formula so the scratch fits worst-case bounds.
+        Uses ``num_local_experts`` (the physical expert count after EP
+        sharding) since ``fused_experts_impl`` calls ``moe_align_block_size``
+        with ``E = w1.shape[0]`` which equals the local expert count.
+        ``cum[-1:]`` returns ``num_tokens_post_padded``, so the array must
+        be sized to exactly ``num_local_experts + 1``.
         """
-        max_pad = num_valid_tokens + self.num_experts * block_size
+        num_e = self.num_local_experts
+        max_pad = num_valid_tokens + num_e * block_size
         max_pad = ((max_pad + block_size - 1) // block_size) * block_size
         max_num_blocks = max_pad // block_size
         cap_n, cap_p = self._align_scratch_capacity
@@ -133,14 +269,10 @@ class TritonFusedMoeExecutor(FusedMoeExpertExecutor):
                     num_valid_tokens, dtype=torch.int64, device=device
                 ),
                 "expert_count": torch.empty(
-                    self.num_experts + 1, dtype=torch.int64, device=device
+                    num_e + 1, dtype=torch.int64, device=device
                 ),
-                "cum": torch.empty(
-                    self.num_experts + 1, dtype=torch.int64, device=device
-                ),
-                "slot_counter": torch.empty(
-                    self.num_experts, dtype=torch.int32, device=device
-                ),
+                "cum": torch.empty(num_e + 1, dtype=torch.int64, device=device),
+                "slot_counter": torch.empty(num_e, dtype=torch.int32, device=device),
                 "sorted_ids": torch.empty(max_pad, dtype=torch.int32, device=device),
                 "expert_ids": torch.empty(
                     max_num_blocks, dtype=torch.int32, device=device
@@ -270,6 +402,14 @@ class TritonFusedMoeExecutor(FusedMoeExpertExecutor):
             device=hidden_states.device,
         )
 
+        # Extract pre-computed bucket/expert_count from fused
+        # recompute_topk_and_align_count (produced by the router's prepare()).
+        pre_bucket = None
+        pre_expert_count = None
+        if payload.expert_tokens_meta is not None:
+            pre_bucket = payload.expert_tokens_meta.align_bucket
+            pre_expert_count = payload.expert_tokens_meta.align_expert_count
+
         out = fused_experts_impl(
             hidden_states=hidden_states.contiguous(),
             w1=self.w13_weight,
@@ -293,5 +433,8 @@ class TritonFusedMoeExecutor(FusedMoeExpertExecutor):
             intermediate_cache3=c3,
             out_hidden_states=out_buf,
             align_scratch=align_scratch,
+            pre_bucket=pre_bucket,
+            pre_expert_count=pre_expert_count,
         )
+
         return CombineForwardPayload(fused_expert_output=out)

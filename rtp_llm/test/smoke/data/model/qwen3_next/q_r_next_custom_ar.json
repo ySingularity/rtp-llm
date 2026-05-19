@@ -1,0 +1,42 @@
+{
+    "model_type": "qwen35_moe",
+    "model_path": "/home/xieshui.yyx/Qwen3.5-35B-A3B-FP8/Qwen3.5-35B-A3B-FP8",
+    "query_result": [
+        {
+            "endpoint": "/v1/chat/completions",
+            "query": {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "who are you?"
+                    }
+                ],
+                "max_tokens": 100,
+                "temperature": 0.0,
+                "top_p": 0,
+                "top_k": 1,
+                "extra_configs": {
+                    "gen_timeline": true
+                }
+            },
+            "result": {
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": "Okay, the user is asking \"who are you?\" I need to introduce myself. I'm Qwen3.5, the latest large language model developed by Tongyi Lab. I should mention my capabilities briefly. Let me check the key points: I have enhanced language understanding, advanced logical reasoning, full-stack code support, deep visual analysis, autonomous agent planning, human alignment optimization, precise long-context control, and multilingual support. I should present this in a friendly and concise way. Avoid technical",
+                            "partial": false
+                        },
+                        "finish_reason": "length"
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 14,
+                    "total_tokens": 114,
+                    "completion_tokens": 100
+                }
+            }
+        }
+    ]
+}

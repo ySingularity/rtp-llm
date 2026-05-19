@@ -92,6 +92,10 @@ def fused_experts_impl(
     intermediate_cache3: Optional[torch.Tensor] = None,
     out_hidden_states: Optional[torch.Tensor] = None,
     align_scratch: Optional[Dict[str, torch.Tensor]] = None,
+    # Pre-computed bucket + expert_count from fused recompute_topk_and_align_count.
+    # When both are supplied, moe_align_block_size skips its count kernel entirely.
+    pre_bucket: Optional[torch.Tensor] = None,
+    pre_expert_count: Optional[torch.Tensor] = None,
     # DeepEP low-latency masked layout. When all three are supplied, the FP8
     # silu+mul+per-block-quant step routes through the masked 3D kernel
     # (one program per (expert, hidden_block, token_partition), iterates only
@@ -165,16 +169,14 @@ def fused_experts_impl(
     # ``deepep_moe_align`` — skip the generic moe_align entirely. Otherwise
     # fall through to the per-call alignment for arbitrary topk_ids.
     #
-    # NOTE: persistent ``align_scratch`` is currently disabled — it caused
-    # garbage outputs in smoke tests, suspected scratch-buffer reallocation
-    # across CUDA graph captures invalidating previously-baked pointers. The
-    # fused 3-kernel moe_align path itself is correct (unit-tested bit-equal
-    # vs. legacy implementation); only the per-call scratch reuse is buggy.
-    # Leaving the codepath in place for future re-enablement once root-cause
-    # is fixed; for now we always allocate scratch fresh.
     if sorted_token_ids is None:
         sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
-            topk_ids, config["BLOCK_SIZE_M"], E, scratch=None
+            topk_ids,
+            config["BLOCK_SIZE_M"],
+            E,
+            scratch=align_scratch,
+            pre_bucket=pre_bucket,
+            pre_expert_count=pre_expert_count,
         )
     else:
         assert (
@@ -235,7 +237,12 @@ def fused_experts_impl(
         if can_alias_out:
             intermediate_cache3 = out_hidden_states.unsqueeze(1)
         else:
-            intermediate_cache3 = torch.empty(
+            # Must zero-init when filter_expert is set: moe_align_block_size
+            # prunes expert=-1 blocks from num_tokens_post_padded so the kernel
+            # early-returns before reaching them — write_zeros_to_output is never
+            # called and uninitialized memory leaks into the reduce step.
+            alloc = torch.zeros if filter_expert else torch.empty
+            intermediate_cache3 = alloc(
                 (num_tokens, topk, w2.shape[1]),
                 device=hidden_states.device,
                 dtype=effective_dtype,

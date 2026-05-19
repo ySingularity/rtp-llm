@@ -254,7 +254,9 @@ def _fwd_kernel_ep_scatter_2_v2(
                 )
                 token_idx = dest_token_index % alignment
                 output_tensor_scale_ptr = (
-                    output_tensor_scale + expert_id * output_tensor_scale_stride0 + token_idx * output_tensor_scale_stride1
+                    output_tensor_scale
+                    + expert_id * output_tensor_scale_stride0
+                    + token_idx * output_tensor_scale_stride1
                 )
                 tl.store(output_tensor_ptr + offset_in, to_copy, mask=mask)
                 tl.store(
@@ -372,7 +374,9 @@ def _fwd_kernel_ep_gather(
                 source_token_index = source_token_index_int32.to(tl.int64)
                 if source_token_index >= 0 and source_token_index < total_input_tokens:
                     acc_weight = tl.load(
-                        recv_topk_weight + cur_token * recv_topk_weight_stride0 + topk_index
+                        recv_topk_weight
+                        + cur_token * recv_topk_weight_stride0
+                        + topk_index
                     )
                     tmp = tl.load(
                         input_tensor
@@ -495,7 +499,11 @@ def tma_align_input_scale(input_scale: torch.Tensor):
         input_view = input_scale
 
     padded_m = get_tma_aligned_size(m, input_scale.element_size())
-    output = torch.empty((g, k_div_block_size, padded_m), dtype=input_scale.dtype, device=input_scale.device)
+    output = torch.empty(
+        (g, k_div_block_size, padded_m),
+        dtype=input_scale.dtype,
+        device=input_scale.device,
+    )
     grid_m = min(m, 8192)
     BLOCK_SIZE_K = triton.next_power_of_2(k_div_block_size)
     _tma_align_input_scale_kernel[(grid_m, g)](
@@ -589,6 +597,68 @@ def recompute_topk_ids_sum_expert_count(
     )
 
     return adjusted_topk_ids, expert_count
+
+
+def recompute_topk_and_align_count(
+    topk_ids: torch.Tensor,
+    current_expert_start_id: int,
+    num_local_experts: int,
+    scratch: "Optional[Dict[str, torch.Tensor]]" = None,
+):
+    """Fused recompute_topk_ids + moe_align bucket/count in one kernel launch.
+
+    Combines the work of ``recompute_topk_ids_sum_expert_count`` and the
+    ``_moe_align_count_kernel`` step of ``moe_align_block_size`` into a single
+    Triton dispatch, eliminating one kernel launch + one zero-fill kernel.
+
+    Args:
+        topk_ids: int32 tensor ``(num_tokens, topk)`` with global expert IDs.
+        current_expert_start_id: first expert ID owned by this rank.
+        num_local_experts: number of experts on this rank.
+        scratch: optional pre-allocated dict with keys ``bucket`` (int64 [N])
+            and ``expert_count`` (int64 [E+1]). When provided, reuses
+            persistent buffers (zero-fill via in-place ``zero_()``).
+
+    Returns:
+        (adjusted_topk_ids, expert_count_int64, bucket):
+        - adjusted_topk_ids: int32 (num_tokens, topk), local id or -1
+        - expert_count_int64: int64 (num_local_experts + 1), per-expert count
+        - bucket: int64 (num_tokens * topk), local id or num_local_experts sentinel
+    """
+    from rtp_llm.models_py.triton_kernels.moe.fused_moe_triton_kernels import (
+        _recompute_topk_and_align_count_kernel,
+    )
+
+    device = topk_ids.device
+    num_tokens, topk = topk_ids.shape
+    num_total = num_tokens * topk
+
+    adjusted_topk_ids = torch.empty_like(topk_ids)
+
+    if scratch is not None:
+        bucket = scratch["bucket"]
+        expert_count = scratch["expert_count"]
+        expert_count.zero_()
+    else:
+        bucket = torch.empty(num_total, dtype=torch.int64, device=device)
+        expert_count = torch.zeros(
+            num_local_experts + 1, dtype=torch.int64, device=device
+        )
+
+    BLOCK_SIZE = 256
+    grid = (triton.cdiv(num_total, BLOCK_SIZE),)
+    _recompute_topk_and_align_count_kernel[grid](
+        topk_ids,
+        adjusted_topk_ids,
+        bucket,
+        expert_count,
+        current_expert_start_id,
+        num_local_experts,
+        num_total,
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+
+    return adjusted_topk_ids, expert_count, bucket
 
 
 @triton.jit

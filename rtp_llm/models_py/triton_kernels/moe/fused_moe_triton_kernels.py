@@ -41,6 +41,45 @@ import triton.language as tl
 
 
 @triton.jit
+def _recompute_topk_and_align_count_kernel(
+    topk_ids_ptr,  # int32 [N], original global expert ids
+    adjusted_topk_ids_ptr,  # int32 [N]; output, local expert id or -1
+    bucket_ptr,  # int64 [N]; output, valid local id or num_experts sentinel
+    expert_count_ptr,  # int64 [E+1]; output, atomically incremented
+    expert_start_id,  # i32
+    num_local_experts,  # i32
+    num_valid_tokens,  # i32
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Fused recompute_topk_ids + moe_align_count in one kernel launch.
+
+    Reads global topk_ids, subtracts expert_start_id, produces:
+    - adjusted_topk_ids: local expert id or -1 (for filtered experts)
+    - bucket: same as adjusted but uses num_local_experts as sentinel (for scatter)
+    - expert_count: atomic per-expert token count (for cumsum/padding)
+
+    Caller must pre-zero expert_count_ptr before launch.
+    """
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    in_range = offsets < num_valid_tokens
+
+    raw = tl.load(topk_ids_ptr + offsets, mask=in_range, other=-1).to(tl.int64)
+
+    adjusted = raw - expert_start_id
+    valid = in_range & (adjusted >= 0) & (adjusted < num_local_experts)
+
+    out_adj = tl.where(valid, adjusted, -1)
+    tl.store(adjusted_topk_ids_ptr + offsets, out_adj.to(tl.int32), mask=in_range)
+
+    bucket = tl.where(valid, adjusted, num_local_experts)
+    tl.store(bucket_ptr + offsets, bucket, mask=in_range)
+
+    safe_bucket = tl.where(valid, adjusted, 0)
+    tl.atomic_add(expert_count_ptr + safe_bucket, 1, mask=valid)
+
+
+@triton.jit
 def _moe_align_count_kernel(
     topk_ids_ptr,  # int32 or int64 [N]
     bucket_ptr,  # int64 [N]; output, valid bucket id or sentinel
@@ -170,6 +209,8 @@ def moe_align_block_size(
     block_size: int,
     num_experts: int,
     scratch: Optional[Dict[str, torch.Tensor]] = None,
+    pre_bucket: Optional[torch.Tensor] = None,
+    pre_expert_count: Optional[torch.Tensor] = None,
 ):
     """Aligns the per-expert token count to ``block_size`` for fused MoE.
 
@@ -184,6 +225,10 @@ def moe_align_block_size(
             buffers are reused and the per-call allocation/fill kernels are
             replaced by in-place ``zero_()`` / ``fill_()``. When omitted,
             falls back to per-call ``torch.zeros`` / ``torch.full``.
+        pre_bucket: Optional pre-computed bucket from fused
+            ``recompute_topk_and_align_count``. When provided together with
+            ``pre_expert_count``, skips the count kernel entirely.
+        pre_expert_count: Optional pre-computed expert_count (int64 [E+1]).
 
     Returns:
         ``(sorted_token_ids, expert_ids, num_tokens_post_pad)`` matching the
@@ -201,8 +246,6 @@ def moe_align_block_size(
     assert topk_ids.dtype in (torch.int32, torch.int64)
     device = topk_ids.device
     num_valid_tokens = topk_ids.numel()  # host-side python int
-    flat = topk_ids.reshape(-1)
-    ids_dtype_flag = 0 if topk_ids.dtype == torch.int32 else 1
 
     # Worst-case padded length. Determined entirely by host-side ints, so
     # safe under graph capture.
@@ -210,10 +253,19 @@ def moe_align_block_size(
     max_pad = ((max_pad + block_size - 1) // block_size) * block_size
     max_num_blocks = max_pad // block_size
 
+    # Fast path: bucket + expert_count already computed by fused kernel.
+    skip_count = pre_bucket is not None and pre_expert_count is not None
+
     # Acquire (or allocate) the scratch buffers.
     if scratch is None:
-        bucket = torch.empty(num_valid_tokens, dtype=torch.int64, device=device)
-        expert_count = torch.zeros(num_experts + 1, dtype=torch.int64, device=device)
+        if not skip_count:
+            bucket = torch.empty(num_valid_tokens, dtype=torch.int64, device=device)
+            expert_count = torch.zeros(
+                num_experts + 1, dtype=torch.int64, device=device
+            )
+        else:
+            bucket = pre_bucket
+            expert_count = pre_expert_count
         cum = torch.zeros(num_experts + 1, dtype=torch.int64, device=device)
         slot_counter = torch.zeros(num_experts, dtype=torch.int32, device=device)
         sorted_ids = torch.full(
@@ -221,36 +273,37 @@ def moe_align_block_size(
         )
         expert_ids = torch.empty(max_num_blocks, dtype=torch.int32, device=device)
     else:
-        bucket = scratch["bucket"]
-        expert_count = scratch["expert_count"]
         cum = scratch["cum"]
         slot_counter = scratch["slot_counter"]
         sorted_ids = scratch["sorted_ids"]
         expert_ids = scratch["expert_ids"]
-        # In-place reset (single kernel each, no allocator traffic). The
-        # zero_() of the int64 ``expert_count`` and int32 ``slot_counter``
-        # replaces 2× ``torch.zeros``; ``sorted_ids.fill_(num_valid_tokens)``
-        # replaces a ``torch.full``. ``cum`` only needs ``cum[0] = 0`` set —
-        # the kernel writes cum[1..E+1] — but a full ``zero_()`` is the
-        # cheapest single kernel and trivially correct.
-        expert_count.zero_()
+        if skip_count:
+            bucket = pre_bucket
+            expert_count = pre_expert_count
+        else:
+            bucket = scratch["bucket"]
+            expert_count = scratch["expert_count"]
+            expert_count.zero_()
         cum.zero_()
         slot_counter.zero_()
         sorted_ids.fill_(num_valid_tokens)
 
-    # 1) Fused bucket + count Triton kernel.
+    # 1) Fused bucket + count Triton kernel (skipped when pre-computed).
     BLOCK = 256
-    if num_valid_tokens > 0:
-        grid_count = (triton.cdiv(num_valid_tokens, BLOCK),)
-        _moe_align_count_kernel[grid_count](
-            flat,
-            bucket,
-            expert_count,
-            num_valid_tokens,
-            num_experts,
-            BLOCK_SIZE=BLOCK,
-            IDS_DTYPE=ids_dtype_flag,
-        )
+    if not skip_count:
+        flat = topk_ids.reshape(-1)
+        ids_dtype_flag = 0 if topk_ids.dtype == torch.int32 else 1
+        if num_valid_tokens > 0:
+            grid_count = (triton.cdiv(num_valid_tokens, BLOCK),)
+            _moe_align_count_kernel[grid_count](
+                flat,
+                bucket,
+                expert_count,
+                num_valid_tokens,
+                num_experts,
+                BLOCK_SIZE=BLOCK,
+                IDS_DTYPE=ids_dtype_flag,
+            )
 
     # 2) Single-block pad+cumsum Triton kernel (sequential within one CTA).
     BLOCK_E = max(_next_pow2(num_experts), 16)

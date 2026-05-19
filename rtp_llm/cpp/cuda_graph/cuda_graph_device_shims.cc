@@ -210,6 +210,15 @@ void finish_capture_session() {
         RTP_LLM_LOG_WARNING("Failed to finish capture session: %s", e.what());
         throw;
     }
+#elif USING_CUDA
+    py::gil_scoped_acquire gil;
+    try {
+        py::module_ hooks = py::module_::import("rtp_llm.models_py.distributed.cuda_graph_hooks");
+        hooks.attr("finish_cuda_graph_capture_session")();
+    } catch (const py::error_already_set& e) {
+        // Not fatal: module may not be loaded if custom AR is not in use
+        PyErr_Clear();
+    }
 #endif
 }
 

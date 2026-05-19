@@ -25,6 +25,10 @@ class ExpertTokensMetadata:
     expected_m: Optional[int] = None
     expert_num_tokens: Optional[torch.Tensor] = None
     expert_num_tokens_cpu: Optional[Union[List[int], torch.Tensor]] = None
+    # Pre-computed bucket and expert_count from fused recompute_topk+align_count.
+    # When set, moe_align_block_size skips its count kernel entirely.
+    align_bucket: Optional[torch.Tensor] = None
+    align_expert_count: Optional[torch.Tensor] = None
 
 
 @dataclass

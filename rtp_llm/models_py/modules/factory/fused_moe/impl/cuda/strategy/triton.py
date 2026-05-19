@@ -122,6 +122,39 @@ class CudaTritonFp8PerBlockStrategy(MoeStrategy):
         )
 
 
+class CudaTritonFp8PerBlockCustomARStrategy(MoeStrategy):
+    """FP8 per-block Triton fused MoE with JIT-compiled custom allreduce.
+
+    Same executor as CudaTritonFp8PerBlockStrategy but replaces NCCL allreduce
+    with IPC-based cross_device_reduce (vllm V1). Gated by explicit
+    moe_strategy='triton_fp8_per_block_custom_ar'.
+    """
+
+    @classmethod
+    def check_conditions(cls, checker: Any, config: MoEConfigAdapter) -> None:
+        resolver = MoeConfigResolver()
+        quant_method = resolver.get_quant_method(config)
+        checker.check(quant_method == "FP8_PER_BLOCK")
+        checker.check(config.moe_strategy == "triton_fp8_per_block_custom_ar")
+
+    def get_attributes(self) -> StrategyAttributes:
+        from rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.executors.triton_fused_moe_executor import (
+            TritonFusedMoeExecutor,
+        )
+        from rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.routers.cross_device_reduce_router import (
+            CrossDeviceReduceRouterFp8PerBlock,
+        )
+
+        return StrategyAttributes(
+            router_class=CrossDeviceReduceRouterFp8PerBlock,
+            executor_class=TritonFusedMoeExecutor,
+            quant_config=FusedMoEQuantConfig(
+                quant_dtype=torch.float8_e4m3fn,
+                block_shape=[128, 128],
+            ),
+        )
+
+
 class CudaTritonFp8PerBlockDpTpStrategy(MoeStrategy):
     """FP8 per-block (128x128) Triton fused MoE for DP+TP mixed topology.
 

@@ -174,6 +174,7 @@ def init_moe_group_args(parser, moe_config, eplb_config, deep_ep_config):
             "triton_no_quant",
             "triton_fp8_per_tensor",
             "triton_fp8_per_block",
+            "triton_fp8_per_block_custom_ar",
         ],
         default="auto",
         help="指定moe strategy, 默认为auto",

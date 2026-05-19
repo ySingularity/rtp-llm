@@ -22,6 +22,7 @@ from .no_quant import (
     CudaNoQuantEpLowLatencyStrategy,
 )
 from .triton import (
+    CudaTritonFp8PerBlockCustomARStrategy,
     CudaTritonFp8PerBlockDpTpStrategy,
     CudaTritonFp8PerBlockStrategy,
     CudaTritonFp8PerTensorStrategy,
@@ -42,6 +43,7 @@ __all__ = [
     "CudaTritonNoQuantStrategy",
     "CudaTritonFp8PerTensorStrategy",
     "CudaTritonFp8PerBlockStrategy",
+    "CudaTritonFp8PerBlockCustomARStrategy",
     "CudaTritonFp8PerBlockDpTpStrategy",
     # FP8 PerBlock
     "CudaFp8PerBlockNoDPMaskedStrategy",

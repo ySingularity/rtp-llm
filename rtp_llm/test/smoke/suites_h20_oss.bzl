@@ -264,9 +264,23 @@ def h20_oss_suites():
             smoke_test(
                 name="next_cudagraph_deepep",
                 task_info="data/model/qwen3_next/q_r_next_cuda_graph.json",
-                smoke_args="--act_type BF16 --seq_size_per_block 2048 --max_seq_len 128 --use_deepep_moe 1 --use_deepep_low_latency 1 --enable_cuda_graph 1 --warm_up 0  --concurrency_limit 8 --reserver_runtime_mem_mb 8192 --tp_size 2",
-                envs=["ACCL_LOW_LATENCY_OPTIMIZE=1"],
+                smoke_args="--act_type BF16 --seq_size_per_block 2048 --max_seq_len 128 --enable_cuda_graph 1 --concurrency_limit 4 --reserver_runtime_mem_mb 8192 --tp_size 2 --kernel_seq_size_per_block 64 --use_deepep_moe 1 --use_deepep_low_latency 1",
                 gpu_type=["H20"],
+                data=native.glob(['data/model/qwen_vl/*.jpeg']),
+            ),
+            smoke_test(
+                name="next_cudagraph_ag_rs",
+                task_info="data/model/qwen3_next/q_r_next_cuda_graph.json",
+                smoke_args="--act_type BF16 --seq_size_per_block 2048 --max_seq_len 128 --enable_cuda_graph 1 --concurrency_limit 4 --reserver_runtime_mem_mb 8192 --tp_size 2 --kernel_seq_size_per_block 64 --moe_strategy fp8_per_block_no_dp_masked",
+                gpu_type=["H20"],
+                data=native.glob(['data/model/qwen_vl/*.jpeg']),
+            ),
+            smoke_test(
+                name="next_custom_ar",
+                task_info="data/model/qwen3_next/q_r_next_custom_ar.json",
+                smoke_args="--act_type BF16 --seq_size_per_block 2048 --max_seq_len 128 --enable_cuda_graph 1 --concurrency_limit 4 --reserver_runtime_mem_mb 8192 --tp_size 4 --kernel_seq_size_per_block 64 --moe_strategy triton_fp8_per_block_custom_ar",
+                gpu_type=["H20"],
+                data=native.glob(['data/model/qwen_vl/*.jpeg']),
             ),
             smoke_test(
                 name="next_long_reuse_memcache",

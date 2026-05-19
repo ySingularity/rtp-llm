@@ -197,6 +197,7 @@ cc_library(
     deps = [
         "//rtp_llm/models_py/bindings:register_ops_hdr",
         "//rtp_llm/models_py/bindings/cuda/kernels:mla_quant_kernel",
+        "//rtp_llm/models_py/bindings/cuda/kernels:custom_all_reduce",
         ":cuda_bindings",
     ],
     visibility = ["//visibility:public"],
@@ -226,7 +227,7 @@ cc_library(
     deps = [
         "//rtp_llm/models_py/bindings:register_ops_hdr",
         ":cuda_bindings_base",
-        ":cuda_attn_bindings_base"
+        ":cuda_attn_bindings_base",
     ] + select({
         "@//:using_cuda12_9": [
             "//rtp_llm/models_py/bindings/cuda/cutlass:fp4_gemm_cu",
