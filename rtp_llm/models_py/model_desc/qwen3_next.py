@@ -493,16 +493,44 @@ class Qwen3NextAttention(CausalAttention):
                     fused_weight, fused_scales
                 )
         else:
-            # Non-e8m0 layout: (K, N). Cat along dim=1 (N).
-            K, N_a = qkv_w.shape
-            K_b, N_b = gate_w.shape
-            assert K == K_b, f"K dim mismatch: {K} vs {K_b}"
-            fused_weight = torch.cat([qkv_w, gate_w], dim=1).contiguous()
-            fused_scales = None
-            qkv_s = weights.get(W.attn_qkv_s)
-            gate_s = weights.get(W.attn_gate_s)
-            if qkv_s is not None and gate_s is not None:
-                fused_scales = torch.cat([qkv_s, gate_s], dim=1).contiguous()
+            is_fp8 = qkv_w.dtype in (
+                torch.float8_e4m3fn,
+                torch.float8_e4m3fnuz,
+            )
+            if is_fp8:
+                # FP8 per-block: shape is (K, N) but memory layout is (N, K)
+                # due to postprocess reshape. Restore (N, K) layout, cat along
+                # N (dim=0), then reshape back to (K, N_total).
+                K, N_a = qkv_w.shape
+                K_b, N_b = gate_w.shape
+                assert K == K_b, f"K dim mismatch: {K} vs {K_b}"
+                qkv_real = qkv_w.reshape(N_a, K)
+                gate_real = gate_w.reshape(N_b, K)
+                fused_weight = torch.cat([qkv_real, gate_real], dim=0).contiguous()
+                fused_weight = fused_weight.reshape(K, N_a + N_b)
+                fused_scales = None
+                qkv_s = weights.get(W.attn_qkv_s)
+                gate_s = weights.get(W.attn_gate_s)
+                if qkv_s is not None and gate_s is not None:
+                    Ks, Ns_a = qkv_s.shape
+                    Ks_b, Ns_b = gate_s.shape
+                    qkv_s_real = qkv_s.reshape(Ns_a, Ks)
+                    gate_s_real = gate_s.reshape(Ns_b, Ks_b)
+                    fused_scales = torch.cat(
+                        [qkv_s_real, gate_s_real], dim=0
+                    ).contiguous()
+                    fused_scales = fused_scales.reshape(Ks, Ns_a + Ns_b)
+            else:
+                # BF16/FP16 layout: (K, N). Cat along dim=1 (N).
+                K, N_a = qkv_w.shape
+                K_b, N_b = gate_w.shape
+                assert K == K_b, f"K dim mismatch: {K} vs {K_b}"
+                fused_weight = torch.cat([qkv_w, gate_w], dim=1).contiguous()
+                fused_scales = None
+                qkv_s = weights.get(W.attn_qkv_s)
+                gate_s = weights.get(W.attn_gate_s)
+                if qkv_s is not None and gate_s is not None:
+                    fused_scales = torch.cat([qkv_s, gate_s], dim=1).contiguous()
         return fused_weight, fused_scales
 
     def forward(
