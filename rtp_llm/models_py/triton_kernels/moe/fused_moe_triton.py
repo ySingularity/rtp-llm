@@ -170,10 +170,18 @@ def fused_experts_impl(
     # fall through to the per-call alignment for arbitrary topk_ids.
     #
     if sorted_token_ids is None:
+        # When pre-computed bucket/expert_count are provided (e.g. from
+        # recompute_topk_and_align_count in pure-TP EP mode), they are sized
+        # for num_local_experts, not the full E from w1.shape. Use the
+        # pre_expert_count tensor size to determine the effective num_experts
+        # so that padcum/scatter kernels don't read out-of-bounds.
+        effective_E = (
+            (pre_expert_count.shape[0] - 1) if pre_expert_count is not None else E
+        )
         sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
             topk_ids,
             config["BLOCK_SIZE_M"],
-            E,
+            effective_E,
             scratch=align_scratch,
             pre_bucket=pre_bucket,
             pre_expert_count=pre_expert_count,
@@ -232,6 +240,7 @@ def fused_experts_impl(
         not no_combine
         and topk == 1
         and (routed_scaling_factor is None or routed_scaling_factor == 1.0)
+        and not filter_expert
     )
     if intermediate_cache3 is None:
         if can_alias_out:

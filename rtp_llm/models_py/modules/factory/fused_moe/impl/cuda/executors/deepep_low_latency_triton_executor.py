@@ -168,6 +168,9 @@ class DeepEPLowLatencyTritonExecutor(FusedMoeExpertExecutor):
         self._intermediate_cache1_buf: Optional[torch.Tensor] = (
             None  # (n_total, N_gateup) bf16
         )
+        self._intermediate_cache3_buf: Optional[torch.Tensor] = (
+            None  # (n_total, 1, hidden) bf16 — down GEMM output, zeroed each call
+        )
         self._out_hidden_states_buf: Optional[torch.Tensor] = (
             None  # (n_total, hidden) bf16
         )
@@ -273,6 +276,9 @@ class DeepEPLowLatencyTritonExecutor(FusedMoeExpertExecutor):
                 "intermediate_cache1": torch.empty(
                     (n_total, N_gateup), device=device, dtype=compute_dtype
                 ),
+                "intermediate_cache3": torch.empty(
+                    (n_total, 1, hidden), device=device, dtype=compute_dtype
+                ),
                 "out_hidden_states": torch.empty(
                     (n_total, hidden), device=device, dtype=compute_dtype
                 ),
@@ -294,6 +300,7 @@ class DeepEPLowLatencyTritonExecutor(FusedMoeExpertExecutor):
         self._align_expert_ids_buf = bufs["align_expert_ids"]
         self._align_num_tokens_post_padded_buf = bufs["align_num_tokens_post_padded"]
         self._intermediate_cache1_buf = bufs["intermediate_cache1"]
+        self._intermediate_cache3_buf = bufs["intermediate_cache3"]
         self._out_hidden_states_buf = bufs["out_hidden_states"]
         self._a2_q_3d_buf = bufs.get("a2_q_3d")
         self._a2_s_3d_buf = bufs.get("a2_s_3d")
@@ -394,6 +401,11 @@ class DeepEPLowLatencyTritonExecutor(FusedMoeExpertExecutor):
             and payload.expert_tokens_meta.expected_m is not None
             else max_recv
         )
+        # Zero intermediate_cache3 so padded rows (which the down GEMM
+        # skips via token_mask) are guaranteed zero — critical under CUDA
+        # graph replay where a fresh torch.zeros on moe_stream would force
+        # a new private-pool allocation per layer and corrupt on replay.
+        self._intermediate_cache3_buf.zero_()
         out = fused_experts_impl(
             hidden_states=flat_x,
             w1=self.w13_weight,
@@ -425,6 +437,7 @@ class DeepEPLowLatencyTritonExecutor(FusedMoeExpertExecutor):
             # Pre-allocated heavy intermediate buffers — keeps
             # fused_experts_impl alloc-free under capture.
             intermediate_cache1=self._intermediate_cache1_buf,
+            intermediate_cache3=self._intermediate_cache3_buf,
             a2_q_3d=self._a2_q_3d_buf,
             a2_s_3d=self._a2_s_3d_buf,
         )
