@@ -797,14 +797,9 @@ class PerBlockFp8Weight(CompositeWeight, QuantWeight):
                 "scale", scale_weight
             )
 
-            # QKV and gate weights are fused at model construction time on e8m0
-            # platforms (Qwen3NextAttention), so skip requant here — the fused
-            # weight will be requanted after cat.
-            is_deferred_fuse = self.kernel.name in (W.attn_qkv_w, W.attn_gate_w)
             if (
                 is_deep_gemm_e8m0_used()
                 and os.environ.get("RTP_LLM_DISABLE_UE8M0_REQUANT", "0") != "1"
-                and not is_deferred_fuse
             ):
                 kernel_weight, scale_weight = requant_weight_ue8m0(
                     kernel_weight, scale_weight

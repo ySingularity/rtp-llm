@@ -445,6 +445,10 @@ class Qwen3NextAttention(CausalAttention):
         quant_config: Optional[object] = None,
         hw_kernel_config: Optional["HWKernelConfig"] = None,
     ):
+        from rtp_llm.models_py.kernels.cuda.deepgemm_wrapper import (
+            is_deep_gemm_e8m0_used,
+        )
+
         super().__init__(
             attn_config,
             parallelism_config,
@@ -456,13 +460,28 @@ class Qwen3NextAttention(CausalAttention):
         self._qkv_size = self.q_size + 2 * (attn_config.kv_head_num * self.head_dim)
         self._gate_size = self.q_size
 
-        fused_weight, fused_scales = self._build_fused_qkv_gate_weights(weights)
-        self.qkv_proj = LinearFactory.create_linear(
-            weight=fused_weight,
-            bias=None,
-            weight_scales=fused_scales,
-            quant_config=quant_config,
-        )
+        if is_deep_gemm_e8m0_used():
+            # On e8m0 (SM 10.x), fusing QKV+gate into a single linear causes
+            # garbled output due to block-scale misalignment during requant.
+            # Use separate linears (weights already requanted by weight loader).
+            self._fused_qkv_gate = False
+            self.gate_proj = LinearFactory.create_linear_from_weights(
+                weights,
+                W.attn_gate_w,
+                W.attn_gate_s,
+                None,
+                quant_config,
+                hw_kernel_config=hw_kernel_config,
+            )
+        else:
+            self._fused_qkv_gate = True
+            fused_weight, fused_scales = self._build_fused_qkv_gate_weights(weights)
+            self.qkv_proj = LinearFactory.create_linear(
+                weight=fused_weight,
+                bias=None,
+                weight_scales=fused_scales,
+                quant_config=quant_config,
+            )
 
     @staticmethod
     def _build_fused_qkv_gate_weights(
@@ -542,9 +561,13 @@ class Qwen3NextAttention(CausalAttention):
         attn_meta: Qwen3NextMetadata = Qwen3NextMetadata(),
     ) -> torch.Tensor:
         input_shape = hidden_states.shape[:-1]
-        fused = self.qkv_proj(hidden_states)
-        qkv = fused[..., : self._qkv_size].contiguous()
-        gate = fused[..., self._qkv_size :].contiguous()
+        if self._fused_qkv_gate:
+            fused = self.qkv_proj(hidden_states)
+            qkv = fused[..., : self._qkv_size].contiguous()
+            gate = fused[..., self._qkv_size :].contiguous()
+        else:
+            qkv = self.qkv_proj(hidden_states)
+            gate = self.gate_proj(hidden_states)
         if self.qk_fuse_norm is not None:
             qkv = self.qk_fuse_norm(qkv)
         attn_output = fmha_impl.forward(qkv, kv_cache, self.layer_idx)

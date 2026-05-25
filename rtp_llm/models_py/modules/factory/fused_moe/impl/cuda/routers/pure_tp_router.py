@@ -364,28 +364,7 @@ class PureTpRouterFp8PerBlockTriton(PureTpRouterFp8PerBlock):
             )
             self._dp_padded_size = padded
 
-        assert a1_scale is None and a2_scale is None, "not support quanted moe"
-        expert_x, expert_x_scale = self._do_quant(a1)
-
-        adjusted_topk_ids, align_expert_count, align_bucket = (
-            recompute_topk_and_align_count(
-                topk_ids, self.expert_start_id, self.expert_num_per_rank
-            )
-        )
-        return ExpertForwardPayload(
-            expert_x,
-            a1.dtype,
-            expert_x_scale,
-            ExpertTokensMetadata(
-                None,
-                None,
-                None,
-                align_bucket=align_bucket,
-                align_expert_count=align_expert_count,
-            ),
-            adjusted_topk_ids,
-            topk_weights,
-        )
+        return super().prepare(a1, a1_scale, a2_scale, topk_weights, topk_ids)
 
     def finalize(
         self,

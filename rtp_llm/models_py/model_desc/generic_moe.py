@@ -233,6 +233,36 @@ class GenericMoeLayer(nn.Module):
                 experts_output = experts_output[dp_offset : dp_offset + local_n]
             return experts_output
 
+        # Two-stream overlap is only safe when we can defer all NCCL/symm-mem
+        # operations to after the join. Both MoE router.finalize() and shared
+        # expert DenseMLP issue collectives on Group.TP; running them on
+        # different CUDA streams concurrently corrupts results via the shared
+        # communicator. When the router supports skip_allreduce we can defer
+        # those collectives. When it doesn't (e.g. DeepEP whose finalize does
+        # an essential all_gather), fall back to sequential execution.
+        can_overlap = self.ffn_tp_size <= 1 or self.fused_moe.supports_skip_allreduce
+
+        if not can_overlap:
+            experts_output = self.fused_moe(
+                hidden_states=working_hidden,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                activation="SiGLU",
+            )
+            if padded > 0:
+                experts_output = experts_output[dp_offset : dp_offset + local_n]
+            shared_expert_output = self.shared_expert(hidden_states)
+            if self.shared_expert_gate is not None:
+                gate_output = self.shared_expert_gate(hidden_states)
+                self.sigmoid_gate_scale_add(
+                    gate_output, shared_expert_output, experts_output
+                )
+            else:
+                experts_output = experts_output + shared_expert_output
+            return experts_output
+
+        skip_allreduce = self.ffn_tp_size > 1
+
         moe_stream = self._ensure_moe_stream()
         default_stream = torch.cuda.current_stream()
 
@@ -246,12 +276,15 @@ class GenericMoeLayer(nn.Module):
                 topk_weights=topk_weights,
                 topk_ids=topk_ids,
                 activation="SiGLU",
+                skip_allreduce=skip_allreduce,
             )
             if padded > 0:
                 experts_output = experts_output[dp_offset : dp_offset + local_n]
 
         # Main stream: shared expert
-        shared_expert_output = self.shared_expert(hidden_states)
+        shared_expert_output = self.shared_expert(
+            hidden_states, skip_allreduce=skip_allreduce
+        )
         if self.shared_expert_gate is not None:
             gate_output = self.shared_expert_gate(hidden_states)
 
@@ -264,6 +297,9 @@ class GenericMoeLayer(nn.Module):
             )
         else:
             experts_output = experts_output + shared_expert_output
+
+        if skip_allreduce:
+            experts_output = all_reduce(experts_output, group=Group.TP)
         return experts_output
 
 

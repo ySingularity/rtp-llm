@@ -99,25 +99,12 @@ class CudaFp8PerBlockEpLowLatencyStrategy(MoeStrategy):
         from rtp_llm.models_py.kernels.cuda.deepgemm_wrapper import (
             is_deep_gemm_e8m0_used,
         )
+        from rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.executors.deepgemm_masked_executor import (
+            DeepGemmMaskedExecutor,
+        )
         from rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.routers.deepep_low_latency_router import (
             DeepEpLowLatencyRouter,
         )
-
-        if (
-            is_deep_gemm_e8m0_used()
-            or os.environ.get("RTP_LLM_DEEPEP_USE_DEEPGEMM") == "1"
-        ):
-            from rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.executors.deepgemm_masked_executor import (
-                DeepGemmMaskedExecutor,
-            )
-
-            executor_class = DeepGemmMaskedExecutor
-        else:
-            from rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.executors.deepep_low_latency_triton_executor import (
-                DeepEPLowLatencyTritonExecutor,
-            )
-
-            executor_class = DeepEPLowLatencyTritonExecutor
 
         quant_config = FusedMoEQuantConfig(
             quant_dtype=torch.float8_e4m3fn,
@@ -125,7 +112,7 @@ class CudaFp8PerBlockEpLowLatencyStrategy(MoeStrategy):
         )
         return StrategyAttributes(
             router_class=DeepEpLowLatencyRouter,
-            executor_class=executor_class,
+            executor_class=DeepGemmMaskedExecutor,
             quant_config=quant_config,
         )
 
