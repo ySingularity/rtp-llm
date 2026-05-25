@@ -401,10 +401,17 @@ class DeepEPLowLatencyTritonExecutor(FusedMoeExpertExecutor):
             and payload.expert_tokens_meta.expected_m is not None
             else max_recv
         )
-        # Zero intermediate_cache3 so padded rows (which the down GEMM
-        # skips via token_mask) are guaranteed zero — critical under CUDA
-        # graph replay where a fresh torch.zeros on moe_stream would force
-        # a new private-pool allocation per layer and corrupt on replay.
+        # Zero shared intermediate buffers so padded rows never contain
+        # stale data from a previous layer/iteration — critical under CUDA
+        # graph replay where persistent buffers survive across replays.
+        # intermediate_cache3: padded rows (skipped by down GEMM via
+        #   token_mask) must be zero for the combine step.
+        # intermediate_cache1: the gate_up GEMM only writes token_mask=True
+        #   positions; under graph replay with varying expert_num_tokens,
+        #   Triton's software-pipelined tl.range in the silu kernel may
+        #   prefetch stale rows, and any residual garbage in unwritten
+        #   positions can corrupt the quantized a2 output.
+        self._intermediate_cache1_buf.zero_()
         self._intermediate_cache3_buf.zero_()
         out = fused_experts_impl(
             hidden_states=flat_x,
