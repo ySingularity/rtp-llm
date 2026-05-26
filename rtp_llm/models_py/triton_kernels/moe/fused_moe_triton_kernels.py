@@ -156,6 +156,8 @@ def _moe_align_padcum_and_expert_ids_kernel(
 
     Single program computes the padded exclusive cumsum of expert_count,
     then iterates over all blocks to assign expert ownership.
+    NOTE: serial loop is slow for large max_num_blocks; prefer the unfused
+    pair (_moe_align_padcum_kernel + _moe_align_expert_ids_kernel).
     """
     if tl.program_id(0) != 0:
         return
@@ -165,15 +167,144 @@ def _moe_align_padcum_and_expert_ids_kernel(
     padded = ((cnt + block_size - 1) // block_size) * block_size
     padded = tl.where(in_range, padded, 0)
     inclusive = tl.cumsum(padded, axis=0)
-    # Write cum[1..E] = inclusive cumsum. cum[0] stays at 0 (pre-zeroed by caller).
     tl.store(cum_ptr + 1 + e, inclusive, mask=in_range)
 
-    # Compute expert_ids for each block using the just-computed cum.
     for bid in range(max_num_blocks):
         block_start = bid * block_size
         count_le = tl.sum(tl.where(inclusive <= block_start, 1, 0).to(tl.int32), axis=0)
         expert_id = tl.where(count_le >= num_experts, -1, count_le)
         tl.store(expert_ids_ptr + bid, expert_id.to(tl.int32))
+
+
+@triton.jit
+def _moe_align_padcum_and_expert_ids_parallel_kernel(
+    expert_count_ptr,  # int64 [E+1]; input
+    cum_ptr,  # int64 [E+1]; output, exclusive cumsum of padded counts
+    expert_ids_ptr,  # int32 [max_num_blocks]; output
+    block_size,  # i32, the BLOCK_SIZE_M for fused MoE
+    num_experts,  # i32
+    BLOCK_E: tl.constexpr,  # power-of-two >= num_experts
+    BLOCK_B: tl.constexpr,  # power-of-two >= max blocks per expert
+):
+    """Fused padcum + expert_ids with grid=(num_experts,) — one program per expert.
+
+    Each program e:
+      1. Loads the full expert_count[BLOCK_E] vector (small, <= 256 elements).
+      2. Computes exclusive prefix: cum_e = sum_{i<e} padded[i].
+      3. Writes cum[e+1] = cum_e + padded[e] (inclusive prefix for this expert).
+      4. Writes expert_ids[cum_e/BSM .. (cum_e+padded_e)/BSM) = e.
+      5. Program 0 also writes cum[0] = 0.
+
+    Produces identical output to the two-kernel sequence
+    (_moe_align_padcum_kernel + _moe_align_expert_ids_kernel).
+    """
+    e = tl.program_id(0)
+
+    # Load full expert_count vector to compute this program's prefix.
+    e_offs = tl.arange(0, BLOCK_E)
+    e_mask = e_offs < num_experts
+    cnt = tl.load(expert_count_ptr + e_offs, mask=e_mask, other=0)
+    # Pad each count up to multiple of block_size.
+    padded = ((cnt + block_size - 1) // block_size) * block_size
+    padded = tl.where(e_mask, padded, 0)
+
+    # Exclusive prefix for this program: sum of padded[i] for i < e.
+    lt_e_mask = (e_offs < e).to(tl.int64)
+    cum_e = tl.sum(padded * lt_e_mask, axis=0)
+
+    # This program's own padded count.
+    cnt_e = tl.load(expert_count_ptr + e)
+    padded_e = ((cnt_e + block_size - 1) // block_size) * block_size
+
+    # Write cum[e+1] = cum_e + padded_e (inclusive cumsum at position e).
+    tl.store(cum_ptr + 1 + e, cum_e + padded_e)
+
+    # Write expert_ids for this expert's blocks.
+    block_start = cum_e // block_size
+    block_count = padded_e // block_size
+    b_offs = tl.arange(0, BLOCK_B)
+    b_mask = b_offs < block_count
+    tl.store(expert_ids_ptr + block_start + b_offs, e, mask=b_mask)
+
+    # Program 0 writes cum[0] = 0.
+    if e == 0:
+        tl.store(cum_ptr, tl.cast(0, tl.int64))
+
+
+@triton.jit
+def _moe_align_padcum_expert_ids_and_fill_kernel(
+    expert_count_ptr,  # int64 [E+1]; input
+    cum_ptr,  # int64 [E+1]; output, exclusive cumsum of padded counts
+    expert_ids_ptr,  # int32 [max_num_blocks]; output
+    sorted_ids_ptr,  # int32 [max_pad]; output (padding slots filled with sentinel)
+    slot_counter_ptr,  # int32 [E]; output, zeroed by this kernel
+    block_size,  # i32, the BLOCK_SIZE_M for fused MoE
+    num_experts,  # i32
+    num_valid_tokens,  # i32, sentinel value for padding slots
+    BLOCK_E: tl.constexpr,  # power-of-two >= num_experts
+    BLOCK_B: tl.constexpr,  # power-of-two >= max blocks per expert
+    BLOCK_PAD: tl.constexpr,  # power-of-two >= block_size (max padding per expert)
+):
+    """Fused padcum + expert_ids + sentinel fill + slot_counter zero.
+
+    Extends _moe_align_padcum_and_expert_ids_parallel_kernel to also write
+    sentinel values (num_valid_tokens) into padding positions of sorted_ids
+    and zero the slot_counter for the subsequent scatter kernel. This
+    eliminates ALL standalone fill/zero calls in the scratch path.
+
+    Each program e:
+      1. Zeros slot_counter[e] (for scatter's atomic_add).
+      2. Computes cum_e, padded_e (same as the non-fill variant).
+      3. Writes cum[e+1], expert_ids (same as before).
+      4. Writes sentinel into sorted_ids[cum_e + count_e .. cum_e + padded_e).
+      5. Program 0 also writes cum[0] = 0.
+    """
+    e = tl.program_id(0)
+
+    # Zero this expert's slot counter (for scatter kernel's atomic_add).
+    tl.store(slot_counter_ptr + e, tl.cast(0, tl.int32))
+
+    # Load full expert_count vector to compute this program's prefix.
+    e_offs = tl.arange(0, BLOCK_E)
+    e_mask = e_offs < num_experts
+    cnt = tl.load(expert_count_ptr + e_offs, mask=e_mask, other=0)
+    # Pad each count up to multiple of block_size.
+    padded = ((cnt + block_size - 1) // block_size) * block_size
+    padded = tl.where(e_mask, padded, 0)
+
+    # Exclusive prefix for this program: sum of padded[i] for i < e.
+    lt_e_mask = (e_offs < e).to(tl.int64)
+    cum_e = tl.sum(padded * lt_e_mask, axis=0)
+
+    # This program's own padded count and actual count.
+    cnt_e = tl.load(expert_count_ptr + e)
+    padded_e = ((cnt_e + block_size - 1) // block_size) * block_size
+
+    # Write cum[e+1] = cum_e + padded_e (inclusive cumsum at position e).
+    tl.store(cum_ptr + 1 + e, cum_e + padded_e)
+
+    # Write expert_ids for this expert's blocks.
+    block_start = cum_e // block_size
+    block_count = padded_e // block_size
+    b_offs = tl.arange(0, BLOCK_B)
+    b_mask = b_offs < block_count
+    tl.store(expert_ids_ptr + block_start + b_offs, e, mask=b_mask)
+
+    # Fill padding slots in sorted_ids with sentinel value.
+    # Valid tokens occupy [cum_e, cum_e + cnt_e); padding is [cum_e + cnt_e, cum_e + padded_e).
+    # Max padding per expert is block_size - 1 (when cnt_e mod block_size == 1).
+    pad_count = padded_e - cnt_e
+    pad_offs = tl.arange(0, BLOCK_PAD)
+    pad_mask = pad_offs < pad_count
+    tl.store(
+        sorted_ids_ptr + cum_e + cnt_e + pad_offs,
+        tl.cast(num_valid_tokens, tl.int32),
+        mask=pad_mask,
+    )
+
+    # Program 0 writes cum[0] = 0.
+    if e == 0:
+        tl.store(cum_ptr, tl.cast(0, tl.int64))
 
 
 @triton.jit
@@ -208,7 +339,7 @@ def _moe_align_scatter_kernel(
     bucket_ptr,  # int64 [N]
     cum_ptr,  # int64 [E + 1]; cum_ptr[e] = padded prefix sum
     slot_counter_ptr,  # int32 [E]; zero-initialized; receives atomic adds
-    sorted_ids_ptr,  # int32 [max_pad]; pre-filled with sentinel
+    sorted_ids_ptr,  # int32 [max_pad]; padding slots pre-filled with sentinel
     num_valid_tokens,  # i32
     num_experts,  # i32
     BLOCK_SIZE: tl.constexpr,
@@ -250,9 +381,13 @@ def moe_align_block_size(
         scratch: Optional pre-allocated scratch dict from the executor (keys:
             ``bucket``, ``expert_count``, ``cum``, ``slot_counter``,
             ``sorted_ids``, ``expert_ids``). When provided, persistent
-            buffers are reused and the per-call allocation/fill kernels are
-            replaced by in-place ``zero_()`` / ``fill_()``. When omitted,
-            falls back to per-call ``torch.zeros`` / ``torch.full``.
+            buffers are reused with NO standalone zero/fill calls needed:
+            the fused padcum kernel writes cum, expert_ids, sorted_ids
+            padding sentinels, AND slot_counter zeros in one launch. Only
+            ``expert_count.zero_()`` is needed when the count kernel runs
+            (skipped when pre_bucket/pre_expert_count are provided).
+            When omitted, falls back to per-call ``torch.zeros`` /
+            ``torch.full``.
         pre_bucket: Optional pre-computed bucket from fused
             ``recompute_topk_and_align_count``. When provided together with
             ``pre_expert_count``, skips the count kernel entirely.
@@ -300,6 +435,7 @@ def moe_align_block_size(
             (max_pad,), num_valid_tokens, dtype=torch.int32, device=device
         )
         expert_ids = torch.empty(max_num_blocks, dtype=torch.int32, device=device)
+        use_fill_kernel = False
     else:
         cum = scratch["cum"]
         slot_counter = scratch["slot_counter"]
@@ -312,10 +448,10 @@ def moe_align_block_size(
             bucket = scratch["bucket"]
             expert_count = scratch["expert_count"]
             expert_count.zero_()
-        # Single zero_() on the contiguous cum_and_slot buffer covers both
-        # cum (int64 [E+1]) and slot_counter (int32 [E]) in one kernel.
-        scratch["cum_and_slot"].zero_()
-        sorted_ids.fill_(num_valid_tokens)
+        # No standalone zero/fill needed: the fused padcum kernel writes cum[0]=0,
+        # cum[e+1], expert_ids, sorted_ids padding sentinels, AND slot_counter[e]=0
+        # all in one launch. The scatter kernel's atomic_add sees zeroed counters.
+        use_fill_kernel = True
 
     # 1) Fused bucket + count Triton kernel (skipped when pre-computed).
     BLOCK = 256
@@ -334,25 +470,44 @@ def moe_align_block_size(
                 IDS_DTYPE=ids_dtype_flag,
             )
 
-    # 2) Padcum + expert_ids as two separate kernels. The parallel expert_ids
-    #    kernel (grid=max_num_blocks) is ~3x faster than the fused single-CTA
-    #    version which serializes all blocks in one thread.
+    # 2) Fused padcum + expert_ids (+ optional sentinel fill): one program per
+    #    expert. Each program computes its own prefix via masked reduction and
+    #    writes its slice of expert_ids. When use_fill_kernel is True, the
+    #    kernel also writes sentinel values into sorted_ids padding slots,
+    #    eliminating the sorted_ids.fill_(sentinel) call.
     BLOCK_E = max(_next_pow2(num_experts), 16)
-    _moe_align_padcum_kernel[(1,)](
-        expert_count,
-        cum,
-        block_size,
-        num_experts,
-        BLOCK_E=BLOCK_E,
-    )
-    _moe_align_expert_ids_kernel[(max_num_blocks,)](
-        cum,
-        expert_ids,
-        block_size,
-        num_experts,
-        max_num_blocks,
-        BLOCK_E=BLOCK_E,
-    )
+    # BLOCK_B must cover the max blocks any single expert can own. Worst case:
+    # all tokens route to one expert → (num_valid_tokens + block_size - 1) //
+    # block_size blocks. But BLOCK_B must be a power of two.
+    max_blocks_per_expert = (num_valid_tokens + block_size - 1) // block_size
+    max_blocks_per_expert = max(max_blocks_per_expert, 1)
+    BLOCK_B = _next_pow2(max_blocks_per_expert)
+    if use_fill_kernel:
+        # BLOCK_PAD covers max padding per expert = block_size - 1.
+        BLOCK_PAD = _next_pow2(block_size)
+        _moe_align_padcum_expert_ids_and_fill_kernel[(num_experts,)](
+            expert_count,
+            cum,
+            expert_ids,
+            sorted_ids,
+            slot_counter,
+            block_size,
+            num_experts,
+            num_valid_tokens,
+            BLOCK_E=BLOCK_E,
+            BLOCK_B=BLOCK_B,
+            BLOCK_PAD=BLOCK_PAD,
+        )
+    else:
+        _moe_align_padcum_and_expert_ids_parallel_kernel[(num_experts,)](
+            expert_count,
+            cum,
+            expert_ids,
+            block_size,
+            num_experts,
+            BLOCK_E=BLOCK_E,
+            BLOCK_B=BLOCK_B,
+        )
 
     # 3) One-pass scatter kernel (writes sorted_ids).
     if num_valid_tokens > 0:

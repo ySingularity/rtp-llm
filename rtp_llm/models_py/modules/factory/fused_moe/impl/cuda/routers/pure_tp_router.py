@@ -27,7 +27,6 @@ from rtp_llm.models_py.modules.factory.fused_moe.utils.config_resolver import (
 )
 from rtp_llm.models_py.triton_kernels.moe.ep_kernels import (
     recompute_topk_and_align_count,
-    recompute_topk_ids_sum_expert_count,
 )
 from rtp_llm.ops.compute_ops import trt_fp8_quantize_128
 
@@ -70,6 +69,11 @@ class PureTpRouterBase(FusedMoeDataRouter):
         self.expert_start_id = self.ep_rank * self.expert_num_per_rank
         self.do_recompute_topk = do_recompute_topk
 
+        # Persistent scratch buffers for fused recompute_topk_and_align_count.
+        # Lazily allocated on first call, then reused for CUDA graph safety.
+        self._align_count_scratch: Optional[dict] = None
+        self._align_count_scratch_capacity: int = 0  # num_valid_tokens
+
     @abstractmethod
     def _do_quant(
         self, a1: torch.Tensor
@@ -84,6 +88,32 @@ class PureTpRouterBase(FusedMoeDataRouter):
         """
         raise NotImplementedError
 
+    def _ensure_align_count_scratch(
+        self, num_valid_tokens: int, device: torch.device
+    ) -> dict:
+        """Get or grow persistent scratch buffers for recompute_topk_and_align_count.
+
+        The scratch dict holds:
+        - bucket: int64 [num_valid_tokens]
+        - expert_count: int64 [num_local_experts + 1]
+
+        Grown during eager warmup; stays fixed during CUDA graph capture/replay.
+        """
+        if (
+            self._align_count_scratch is None
+            or self._align_count_scratch_capacity < num_valid_tokens
+        ):
+            self._align_count_scratch = {
+                "bucket": torch.empty(
+                    num_valid_tokens, dtype=torch.int64, device=device
+                ),
+                "expert_count": torch.zeros(
+                    self.expert_num_per_rank + 1, dtype=torch.int64, device=device
+                ),
+            }
+            self._align_count_scratch_capacity = num_valid_tokens
+        return self._align_count_scratch
+
     def prepare(
         self,
         a1: torch.Tensor,
@@ -97,13 +127,27 @@ class PureTpRouterBase(FusedMoeDataRouter):
         expert_x, expert_x_scale = self._do_quant(a1)
 
         adjusted_topk_ids = topk_ids
-        num_recv_tokens_per_expert = None
+        expert_num_tokens = None
+        align_bucket = None
+        align_expert_count = None
         # Recompute topk if needed
         if self.do_recompute_topk:
-            adjusted_topk_ids, num_recv_tokens_per_expert = (
-                recompute_topk_ids_sum_expert_count(
-                    topk_ids, self.expert_start_id, self.expert_num_per_rank
+            num_valid_tokens = topk_ids.numel()
+            scratch = self._ensure_align_count_scratch(
+                num_valid_tokens, topk_ids.device
+            )
+            adjusted_topk_ids, align_expert_count, align_bucket = (
+                recompute_topk_and_align_count(
+                    topk_ids,
+                    self.expert_start_id,
+                    self.expert_num_per_rank,
+                    scratch=scratch,
                 )
+            )
+            # align_expert_count is int64 [E+1]; first E elements are per-expert
+            # token counts. DeepGemmHybridExecutor needs this as int32 [E].
+            expert_num_tokens = align_expert_count[: self.expert_num_per_rank].to(
+                torch.int32
             )
         return ExpertForwardPayload(
             expert_x,
@@ -111,8 +155,10 @@ class PureTpRouterBase(FusedMoeDataRouter):
             expert_x_scale,
             ExpertTokensMetadata(
                 None,
-                num_recv_tokens_per_expert,
+                expert_num_tokens,
                 None,
+                align_bucket=align_bucket,
+                align_expert_count=align_expert_count,
             ),
             adjusted_topk_ids,
             topk_weights,
