@@ -334,11 +334,18 @@ def moe_align_block_size(
                 IDS_DTYPE=ids_dtype_flag,
             )
 
-    # 2) Fused padcum + expert_ids (single CTA computes cumsum then assigns
-    #    expert ownership per block — replaces 2 separate kernel launches).
+    # 2) Padcum + expert_ids as two separate kernels. The parallel expert_ids
+    #    kernel (grid=max_num_blocks) is ~3x faster than the fused single-CTA
+    #    version which serializes all blocks in one thread.
     BLOCK_E = max(_next_pow2(num_experts), 16)
-    _moe_align_padcum_and_expert_ids_kernel[(1,)](
+    _moe_align_padcum_kernel[(1,)](
         expert_count,
+        cum,
+        block_size,
+        num_experts,
+        BLOCK_E=BLOCK_E,
+    )
+    _moe_align_expert_ids_kernel[(max_num_blocks,)](
         cum,
         expert_ids,
         block_size,

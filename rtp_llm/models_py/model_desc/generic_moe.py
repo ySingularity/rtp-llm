@@ -240,7 +240,9 @@ class GenericMoeLayer(nn.Module):
         # communicator. When the router supports skip_allreduce we can defer
         # those collectives. When it doesn't (e.g. DeepEP whose finalize does
         # an essential all_gather), fall back to sequential execution.
-        can_overlap = self.ffn_tp_size <= 1 or self.fused_moe.supports_skip_allreduce
+        can_overlap = (
+            self.ffn_tp_size <= 1 or self.fused_moe.supports_skip_allreduce
+        ) and padded == 0
 
         if not can_overlap:
             experts_output = self.fused_moe(

@@ -79,6 +79,10 @@ class PureTpRouterFp8PerBlockTritonDpTp(PureTpRouterFp8PerBlock):
     1× all_reduce(world) (gather) + 1× all_reduce(world) (combine).
     """
 
+    @property
+    def supports_skip_allreduce(self) -> bool:
+        return False
+
     @classmethod
     def check_conditions(cls, checker: Any, config: MoEConfigAdapter) -> None:
         resolver = MoeConfigResolver()
