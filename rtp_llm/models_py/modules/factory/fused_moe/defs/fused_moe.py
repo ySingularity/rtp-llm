@@ -4,6 +4,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union, final
 
 import torch
 
+from rtp_llm.models_py.distributed.collective_torch import Group, all_reduce
 from rtp_llm.models_py.modules.factory.fused_moe.defs.config_adapter import (
     MoEConfigAdapter,
 )
@@ -125,6 +126,9 @@ class FusedMoeDataRouter(ABC):
     ) -> torch.Tensor:
         raise NotImplementedError
 
+    def allreduce(self, tensor: torch.Tensor) -> torch.Tensor:
+        return all_reduce(tensor, group=Group.TP)
+
 
 class FusedMoeExpertExecutor(ABC):
     def __init__(
@@ -194,6 +198,9 @@ class FusedMoe(torch.nn.Module):
     def supports_skip_allreduce(self) -> bool:
         """Delegates to the underlying router's capability flag."""
         return self.router.supports_skip_allreduce
+
+    def allreduce(self, tensor: torch.Tensor) -> torch.Tensor:
+        return self.router.allreduce(tensor)
 
     @property
     def topk_ids_dtype(self) -> torch.dtype:

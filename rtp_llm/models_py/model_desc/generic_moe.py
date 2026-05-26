@@ -299,7 +299,7 @@ class GenericMoeLayer(nn.Module):
             experts_output = experts_output + shared_expert_output
 
         if skip_allreduce:
-            experts_output = all_reduce(experts_output, group=Group.TP)
+            experts_output = self.fused_moe.allreduce(experts_output)
         return experts_output
 
 

@@ -238,6 +238,21 @@ class CrossDeviceReduceRouterFp8PerBlock(PureTpRouterFp8PerBlockTriton):
 
         return all_reduce(out, group=Group.TP)
 
+    def allreduce(self, tensor: torch.Tensor) -> torch.Tensor:
+        if self._custom_ar_enabled:
+            inp_size = tensor.numel() * tensor.element_size()
+            if inp_size <= self._max_ar_size and inp_size % 16 == 0:
+                result = torch.empty_like(tensor)
+                self._custom_ar.all_reduce(
+                    self._fa_ptr,
+                    tensor,
+                    result,
+                    self._reg_buffer,
+                    self._max_ar_size,
+                )
+                return result
+        return all_reduce(tensor, group=Group.TP)
+
     def __del__(self):
         if hasattr(self, "_post_capture_cb"):
             unregister_post_capture_callback(self._post_capture_cb)
