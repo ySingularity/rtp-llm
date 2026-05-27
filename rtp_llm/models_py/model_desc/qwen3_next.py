@@ -36,11 +36,19 @@ if _DEVICE_TYPE == DeviceType.Cuda:
     from rtp_llm.models_py.triton_kernels.common.fused_rmsnorm_gated_fp8_quant import (
         fused_rmsnorm_gated_fp8_quant,
     )
+
+    try:
+        from rtp_llm.models_py.triton_kernels.common.attn_output_gate import (
+            sigmoid_mul_fp8_quant_fwd,
+        )
+    except ImportError:
+        sigmoid_mul_fp8_quant_fwd = None  # type: ignore
 else:
     CudaFp8GEMMLinear = None  # type: ignore
     fused_add_rmsnorm_fp8_quant = None  # type: ignore
     fused_add_rmsnorm_fp8_quant_with_bf16_output = None  # type: ignore
     fused_rmsnorm_gated_fp8_quant = None  # type: ignore
+    sigmoid_mul_fp8_quant_fwd = None  # type: ignore
 from rtp_llm.models_py.modules.base.common.kvcache_store import WriteCacheStoreOp
 from rtp_llm.models_py.triton_kernels.causal_conv1d import (
     CausalConv1dMetadata,
@@ -582,14 +590,30 @@ class Qwen3NextAttention(CausalAttention):
         x_fp8: Optional[torch.Tensor] = None,
         x_scale: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if x_fp8 is not None and x_scale is not None:
-            gate = self.gate(x_fp8, input_scales=x_scale)
+        input_shape = hidden_states.shape[:-1]
+        if self._fused_qkv_gate:
+            if x_fp8 is not None and x_scale is not None:
+                fused = self.qkv_proj(x_fp8, input_scales=x_scale)
+            else:
+                fused = self.qkv_proj(hidden_states)
+            qkv = fused[..., : self._qkv_size].contiguous()
+            gate = fused[..., self._qkv_size :].contiguous()
         else:
-            gate = self.gate(hidden_states)
-        attn_out = super().forward(
-            hidden_states, fmha_impl, kv_cache, gate, x_fp8=x_fp8, x_scale=x_scale
-        )
-        return attn_out
+            if x_fp8 is not None and x_scale is not None:
+                qkv = self.qkv_proj(x_fp8, input_scales=x_scale)
+                gate = self.gate_proj(x_fp8, input_scales=x_scale)
+            else:
+                qkv = self.qkv_proj(hidden_states)
+                gate = self.gate_proj(hidden_states)
+        if self.qk_fuse_norm is not None:
+            qkv = self.qk_fuse_norm(qkv)
+        attn_output = fmha_impl.forward(qkv, kv_cache, self.layer_idx)
+        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+        attn_output = attn_output.mul_(gate.sigmoid_())
+        output = self.o_proj(attn_output)
+        if self.tp_size > 1:
+            output = all_reduce(output, group=Group.TP)
+        return output
 
 
 class Qwen3NextGatedDeltaNet(nn.Module):
@@ -600,6 +624,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         weights: Dict[str, torch.Tensor],
         layernorm_eps: float,
         quant_config: Optional[object] = None,
+        hw_kernel_config: Optional["HWKernelConfig"] = None,
     ):
         super().__init__()
         self.linear_attn_config = linear_attn_config
@@ -903,6 +928,7 @@ class Qwen3NextDecoderLayer(nn.Module):
         moe_config,
         max_generate_batch_size: int = 0,
         enable_cuda_graph: bool = False,
+        hw_kernel_config: Optional["HWKernelConfig"] = None,
     ):
         super().__init__()
         self.layer_idx = layer_idx
@@ -927,6 +953,7 @@ class Qwen3NextDecoderLayer(nn.Module):
                 weights,
                 config.layernorm_eps,
                 config.quant_config,
+                hw_kernel_config,
             )
 
         if config.moe_style == 2:
@@ -1123,6 +1150,7 @@ class Qwen3NextModel(GptModelBase):
             if py_hw_kernel_config is not None
             else False
         )
+        self._enable_cuda_graph = enable_cuda_graph
         self.layers = nn.ModuleList(
             [
                 Qwen3NextDecoderLayer(
@@ -1133,6 +1161,7 @@ class Qwen3NextModel(GptModelBase):
                     moe_config,
                     max_generate_batch_size,
                     enable_cuda_graph,
+                    py_hw_kernel_config,
                 )
                 for idx in range(self.layer_num)
             ]
@@ -1151,18 +1180,17 @@ class Qwen3NextModel(GptModelBase):
         if fmha_impl is None:
             fmha_impl = self.prepare_fmha_impl(inputs)
 
-        is_capturing = torch.cuda.is_current_stream_capturing()
-        if is_capturing:
-            self._cuda_graph_captured = True
-        if not getattr(self, "_cuda_graph_captured", False) and not is_capturing:
-            if not getattr(self, "_cublas_warmed", False):
+        if self._enable_cuda_graph:
+            is_capturing = torch.cuda.is_current_stream_capturing()
+            if is_capturing:
+                self._cuda_graph_captured = True
+            if not getattr(self, "_cuda_graph_captured", False) and not is_capturing:
+                if getattr(self, "_cublas_warmed", False):
+                    hidden_states = torch.zeros_like(hidden_states)
+                    residual = torch.zeros_like(hidden_states)
+                    hidden_states, _ = self.norm(hidden_states, residual)
+                    return PyModelOutputs(hidden_states, fmha_impl.fmha_params)
                 self._cublas_warmed = True
-                self._warmup_cublas(hidden_states)
-                self._warmup_flashinfer_jit()
-            hidden_states = torch.zeros_like(hidden_states)
-            residual = torch.zeros_like(hidden_states)
-            hidden_states, _ = self.norm(hidden_states, residual)
-            return PyModelOutputs(hidden_states, fmha_impl.fmha_params)
 
         attention_inputs: PyAttentionInputs = inputs.attention_inputs
         prefill_conv1d_meta = None
