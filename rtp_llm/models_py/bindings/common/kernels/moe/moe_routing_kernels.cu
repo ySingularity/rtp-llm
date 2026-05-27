@@ -467,7 +467,7 @@ void topkGatingSoftmaxKernelLauncher(float const*                    input,
         break;
 
     switch (num_experts) {
-        CASE(1) CASE(2) CASE(4) CASE(8) CASE(16) CASE(32) CASE(64) CASE(128) CASE(256) default: {
+        CASE(1) CASE(2) CASE(4) CASE(8) CASE(16) CASE(32) CASE(64) CASE(128) CASE(256) CASE(512) default: {
             static constexpr int TPB = 256;
             TLLM_CHECK(softmax_temp_output != nullptr);
             moeSoftmax<TPB><<<num_rows, TPB, 0, stream>>>(input, nullptr, softmax_temp_output, num_experts);
@@ -556,7 +556,7 @@ void topkKernelLauncher(float const*                    input,
         break;
 
     switch (num_experts) {
-        CASE(1) CASE(2) CASE(4) CASE(8) CASE(16) CASE(32) CASE(64) CASE(128) CASE(256) default: {
+        CASE(1) CASE(2) CASE(4) CASE(8) CASE(16) CASE(32) CASE(64) CASE(128) CASE(256) CASE(512) default: {
             topkKernelLauncherHelper<256>(input,
                                           input_with_bias,
                                           output,

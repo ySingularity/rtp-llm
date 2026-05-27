@@ -467,10 +467,7 @@ def fused_experts_impl(
             out=out_hidden_states,
         )
     elif routed_scaling_factor == 1.0:
-        # When scaling factor is 1.0 (e.g. Qwen3.5 where GroupTopK already
-        # incorporates it into topk_weights), a single torch.sum suffices —
-        # avoids the redundant mul_(1.0) kernel (~1us/layer savings).
-        torch.sum(intermediate_cache3, dim=1, out=out_hidden_states)
+        moe_sum_reduce_triton(intermediate_cache3, out_hidden_states, 1.0)
     elif num_tokens <= 32:
         # Small-token path (see _moe_sum_reduce_torch_compile).
         _moe_sum_reduce_torch_compile(

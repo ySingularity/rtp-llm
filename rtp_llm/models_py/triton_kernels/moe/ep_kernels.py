@@ -12,6 +12,12 @@ from rtp_llm.models_py.utils.math import ceil_div
 logger = logging.getLogger(__name__)
 
 
+def _next_pow2(n: int) -> int:
+    if n <= 1:
+        return 1
+    return 1 << (n - 1).bit_length()
+
+
 @triton.jit
 def _fwd_kernel_ep_scatter_1(
     num_recv_tokens_per_expert,
@@ -638,7 +644,6 @@ def recompute_topk_and_align_count(
     if scratch is not None:
         bucket = scratch["bucket"]
         expert_count = scratch["expert_count"]
-        expert_count.zero_()
     else:
         bucket = torch.empty(num_total, dtype=torch.int64, device=device)
         expert_count = torch.zeros(
@@ -647,6 +652,11 @@ def recompute_topk_and_align_count(
 
     BLOCK_SIZE = 256
     grid = (triton.cdiv(num_total, BLOCK_SIZE),)
+    # When grid==1 (decode path), inline the expert_count zero into the kernel
+    # to eliminate a separate .zero_() kernel launch.
+    inline_zero = grid[0] == 1
+    if not inline_zero and scratch is not None:
+        expert_count.zero_()
     _recompute_topk_and_align_count_kernel[grid](
         topk_ids,
         adjusted_topk_ids,
@@ -656,6 +666,7 @@ def recompute_topk_and_align_count(
         num_local_experts,
         num_total,
         BLOCK_SIZE=BLOCK_SIZE,
+        BLOCK_E=_next_pow2(num_local_experts + 1) if inline_zero else 0,
     )
 
     return adjusted_topk_ids, expert_count, bucket

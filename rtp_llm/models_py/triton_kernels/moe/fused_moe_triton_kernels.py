@@ -50,6 +50,7 @@ def _recompute_topk_and_align_count_kernel(
     num_local_experts,  # i32
     num_valid_tokens,  # i32
     BLOCK_SIZE: tl.constexpr,
+    BLOCK_E: tl.constexpr = 0,  # >0 enables inline zero of expert_count (grid=1 only)
 ):
     """Fused recompute_topk_ids + moe_align_count in one kernel launch.
 
@@ -58,9 +59,21 @@ def _recompute_topk_and_align_count_kernel(
     - bucket: same as adjusted but uses num_local_experts as sentinel (for scatter)
     - expert_count: atomic per-expert token count (for cumsum/padding)
 
-    Caller must pre-zero expert_count_ptr before launch.
+    When BLOCK_E > 0, zeros expert_count inline (only safe for grid=1).
+    Otherwise caller must pre-zero expert_count_ptr before launch.
     """
     pid = tl.program_id(0)
+
+    # Inline zero: eliminates the standalone expert_count.zero_() kernel launch.
+    if BLOCK_E > 0:
+        ec_offs = tl.arange(0, BLOCK_E)
+        ec_mask = ec_offs < (num_local_experts + 1)
+        tl.store(
+            expert_count_ptr + ec_offs,
+            tl.zeros((BLOCK_E,), dtype=tl.int64),
+            mask=ec_mask,
+        )
+
     offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     in_range = offsets < num_valid_tokens
 
@@ -308,6 +321,79 @@ def _moe_align_padcum_expert_ids_and_fill_kernel(
 
 
 @triton.jit
+def _moe_align_padcum_expert_ids_fill_and_scatter_kernel(
+    expert_count_ptr,  # int64 [E+1]; input
+    cum_ptr,  # int64 [E+1]; output, exclusive cumsum of padded counts
+    expert_ids_ptr,  # int32 [max_num_blocks]; output
+    sorted_ids_ptr,  # int32 [max_pad]; output
+    bucket_ptr,  # int64 [N]; input (from count kernel)
+    block_size,  # i32, the BLOCK_SIZE_M for fused MoE
+    num_experts,  # i32
+    num_valid_tokens,  # i32, sentinel value for padding slots
+    BLOCK_E: tl.constexpr,  # power-of-two >= num_experts
+    BLOCK_B: tl.constexpr,  # power-of-two >= max blocks per expert
+    BLOCK_PAD: tl.constexpr,  # power-of-two >= block_size
+    BLOCK_T: tl.constexpr,  # power-of-two >= num_valid_tokens
+):
+    """Fully fused padcum + expert_ids + sentinel fill + scatter.
+
+    Eliminates the separate scatter kernel by having each expert program
+    scan the bucket array and place its own tokens via tl.cumsum ranking.
+    Only suitable for decode-sized token counts (num_valid_tokens <= BLOCK_T).
+    """
+    e = tl.program_id(0)
+
+    # Load full expert_count vector to compute this program's prefix.
+    e_offs = tl.arange(0, BLOCK_E)
+    e_mask = e_offs < num_experts
+    cnt = tl.load(expert_count_ptr + e_offs, mask=e_mask, other=0)
+    padded = ((cnt + block_size - 1) // block_size) * block_size
+    padded = tl.where(e_mask, padded, 0)
+
+    # Exclusive prefix for this program: sum of padded[i] for i < e.
+    lt_e_mask = (e_offs < e).to(tl.int64)
+    cum_e = tl.sum(padded * lt_e_mask, axis=0)
+
+    # This program's own padded count and actual count.
+    cnt_e = tl.load(expert_count_ptr + e)
+    padded_e = ((cnt_e + block_size - 1) // block_size) * block_size
+
+    # Write cum[e+1] = cum_e + padded_e.
+    tl.store(cum_ptr + 1 + e, cum_e + padded_e)
+
+    # Write expert_ids for this expert's blocks.
+    block_start = cum_e // block_size
+    block_count = padded_e // block_size
+    b_offs = tl.arange(0, BLOCK_B)
+    b_mask = b_offs < block_count
+    tl.store(expert_ids_ptr + block_start + b_offs, e, mask=b_mask)
+
+    # Scatter: scan bucket, find tokens belonging to this expert, place them.
+    t_offs = tl.arange(0, BLOCK_T)
+    t_mask = t_offs < num_valid_tokens
+    bkt = tl.load(bucket_ptr + t_offs, mask=t_mask, other=num_experts)
+    match = bkt == e
+    # cumsum of match gives 1-based rank for each matching token.
+    rank = tl.cumsum(match.to(tl.int32), axis=0) - 1
+    dest = cum_e + rank.to(tl.int64)
+    tl.store(sorted_ids_ptr + dest, t_offs.to(tl.int32), mask=match & t_mask)
+
+    # Fill padding slots with sentinel.
+    pad_count = padded_e - cnt_e
+    pad_offs = tl.arange(0, BLOCK_PAD)
+    pad_mask = pad_offs < pad_count
+    tl.store(
+        sorted_ids_ptr + cum_e + cnt_e + pad_offs,
+        tl.cast(num_valid_tokens, tl.int32),
+        mask=pad_mask,
+    )
+
+    # Program 0 writes cum[0] = 0.
+    if e == 0:
+        tl.store(cum_ptr, tl.cast(0, tl.int64))
+
+
+@triton.jit
 def _moe_align_expert_ids_kernel(
     cum_ptr,  # int64 [E+1]
     expert_ids_ptr,  # int32 [max_num_blocks]; output
@@ -470,21 +556,39 @@ def moe_align_block_size(
                 IDS_DTYPE=ids_dtype_flag,
             )
 
-    # 2) Fused padcum + expert_ids (+ optional sentinel fill): one program per
-    #    expert. Each program computes its own prefix via masked reduction and
-    #    writes its slice of expert_ids. When use_fill_kernel is True, the
-    #    kernel also writes sentinel values into sorted_ids padding slots,
-    #    eliminating the sorted_ids.fill_(sentinel) call.
+    # 2) Fused padcum + expert_ids + scatter. For decode-sized token counts
+    #    (num_valid_tokens <= 512), fuse the scatter into the padcum kernel
+    #    to eliminate one kernel launch. Each expert program scans the bucket
+    #    array and places its tokens via tl.cumsum ranking.
     BLOCK_E = max(_next_pow2(num_experts), 16)
-    # BLOCK_B must cover the max blocks any single expert can own. Worst case:
-    # all tokens route to one expert → (num_valid_tokens + block_size - 1) //
-    # block_size blocks. But BLOCK_B must be a power of two.
     max_blocks_per_expert = (num_valid_tokens + block_size - 1) // block_size
     max_blocks_per_expert = max(max_blocks_per_expert, 1)
     BLOCK_B = _next_pow2(max_blocks_per_expert)
-    if use_fill_kernel:
-        # BLOCK_PAD covers max padding per expert = block_size - 1.
-        BLOCK_PAD = _next_pow2(block_size)
+    BLOCK_PAD = _next_pow2(block_size)
+
+    # Fuse scatter when token count fits in a single BLOCK_T vector load.
+    _MAX_FUSED_SCATTER_TOKENS = 512
+    use_fused_scatter = (
+        use_fill_kernel and num_valid_tokens <= _MAX_FUSED_SCATTER_TOKENS
+    )
+
+    if use_fused_scatter:
+        BLOCK_T = _next_pow2(max(num_valid_tokens, 1))
+        _moe_align_padcum_expert_ids_fill_and_scatter_kernel[(num_experts,)](
+            expert_count,
+            cum,
+            expert_ids,
+            sorted_ids,
+            bucket,
+            block_size,
+            num_experts,
+            num_valid_tokens,
+            BLOCK_E=BLOCK_E,
+            BLOCK_B=BLOCK_B,
+            BLOCK_PAD=BLOCK_PAD,
+            BLOCK_T=BLOCK_T,
+        )
+    elif use_fill_kernel:
         _moe_align_padcum_expert_ids_and_fill_kernel[(num_experts,)](
             expert_count,
             cum,
@@ -498,6 +602,17 @@ def moe_align_block_size(
             BLOCK_B=BLOCK_B,
             BLOCK_PAD=BLOCK_PAD,
         )
+        if num_valid_tokens > 0:
+            grid_scatter = (triton.cdiv(num_valid_tokens, BLOCK),)
+            _moe_align_scatter_kernel[grid_scatter](
+                bucket,
+                cum,
+                slot_counter,
+                sorted_ids,
+                num_valid_tokens,
+                num_experts,
+                BLOCK_SIZE=BLOCK,
+            )
     else:
         _moe_align_padcum_and_expert_ids_parallel_kernel[(num_experts,)](
             expert_count,
@@ -508,19 +623,17 @@ def moe_align_block_size(
             BLOCK_E=BLOCK_E,
             BLOCK_B=BLOCK_B,
         )
-
-    # 3) One-pass scatter kernel (writes sorted_ids).
-    if num_valid_tokens > 0:
-        grid_scatter = (triton.cdiv(num_valid_tokens, BLOCK),)
-        _moe_align_scatter_kernel[grid_scatter](
-            bucket,
-            cum,
-            slot_counter,
-            sorted_ids,
-            num_valid_tokens,
-            num_experts,
-            BLOCK_SIZE=BLOCK,
-        )
+        if num_valid_tokens > 0:
+            grid_scatter = (triton.cdiv(num_valid_tokens, BLOCK),)
+            _moe_align_scatter_kernel[grid_scatter](
+                bucket,
+                cum,
+                slot_counter,
+                sorted_ids,
+                num_valid_tokens,
+                num_experts,
+                BLOCK_SIZE=BLOCK,
+            )
 
     # Publish total_pad as a device-side int32 tensor so the kernel can read
     # it without a host sync. ``cum[-1]`` holds the inclusive cumsum total;
