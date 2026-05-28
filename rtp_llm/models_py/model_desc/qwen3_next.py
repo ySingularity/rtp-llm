@@ -488,6 +488,8 @@ class Qwen3NextAttention(CausalAttention):
         self._qkv_size = self.q_size + 2 * (attn_config.kv_head_num * self.head_dim)
         self._gate_size = self.q_size
 
+        self._custom_allreduce = None
+
         if is_deep_gemm_e8m0_used():
             # On e8m0 (SM 10.x), fusing QKV+gate into a single linear causes
             # garbled output due to block-scale misalignment during requant.
@@ -612,7 +614,10 @@ class Qwen3NextAttention(CausalAttention):
         attn_output = attn_output.mul_(gate.sigmoid_())
         output = self.o_proj(attn_output)
         if self.tp_size > 1:
-            output = all_reduce(output, group=Group.TP)
+            if self._custom_allreduce is not None:
+                output = self._custom_allreduce(output)
+            else:
+                output = all_reduce(output, group=Group.TP)
         return output
 
 
@@ -627,6 +632,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         hw_kernel_config: Optional["HWKernelConfig"] = None,
     ):
         super().__init__()
+        self._custom_allreduce = None
         self.linear_attn_config = linear_attn_config
         self.parallelism_config = parallelism_config
         self.weights = weights
@@ -914,7 +920,10 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             )
             attn_output = self.out_proj(attn_output)
         if self.parallelism_config.get_attn_tp_size() > 1:
-            attn_output = all_reduce(attn_output, group=Group.TP)
+            if self._custom_allreduce is not None:
+                attn_output = self._custom_allreduce(attn_output)
+            else:
+                attn_output = all_reduce(attn_output, group=Group.TP)
         return attn_output
 
 
@@ -969,6 +978,13 @@ class Qwen3NextDecoderLayer(nn.Module):
             self.mlp = DenseMLP(
                 config.activation_type, parallelism_config, weights, config.quant_config
             )
+
+        if (
+            isinstance(self.mlp, GenericMoeLayer)
+            and hasattr(self.mlp, "fused_moe")
+            and self.mlp.fused_moe.supports_skip_allreduce
+        ):
+            self.self_attn._custom_allreduce = self.mlp.fused_moe.allreduce
 
         self.input_layernorm = RMSResNorm(
             weights[W.pre_ln_gamma], eps=config.layernorm_eps
