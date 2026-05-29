@@ -26,6 +26,7 @@ from .triton import (
     CudaTritonFp8PerBlockDpTpStrategy,
     CudaTritonFp8PerBlockStrategy,
     CudaTritonFp8PerTensorStrategy,
+    CudaTritonNoQuantCustomARStrategy,
     CudaTritonNoQuantStrategy,
 )
 from .w4a8_int4_per_channel import (
@@ -41,6 +42,7 @@ __all__ = [
     "CudaNoQuantDpNormalStrategy",
     # Triton fused MoE (sglang TritonRunnerCore port)
     "CudaTritonNoQuantStrategy",
+    "CudaTritonNoQuantCustomARStrategy",
     "CudaTritonFp8PerTensorStrategy",
     "CudaTritonFp8PerBlockStrategy",
     "CudaTritonFp8PerBlockCustomARStrategy",

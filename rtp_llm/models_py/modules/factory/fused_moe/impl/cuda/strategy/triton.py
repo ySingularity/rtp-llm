@@ -52,6 +52,36 @@ class CudaTritonNoQuantStrategy(MoeStrategy):
         )
 
 
+class CudaTritonNoQuantCustomARStrategy(MoeStrategy):
+    """BF16/FP16 Triton fused MoE with JIT-compiled custom allreduce.
+
+    Same executor as CudaTritonNoQuantStrategy but replaces NCCL allreduce
+    with IPC-based cross_device_reduce (vllm V1). Gated by explicit
+    moe_strategy='triton_no_quant_custom_ar'.
+    """
+
+    @classmethod
+    def check_conditions(cls, checker: Any, config: MoEConfigAdapter) -> None:
+        resolver = MoeConfigResolver()
+        quant_method = resolver.get_quant_method(config)
+        checker.check(quant_method is None)
+        checker.check(config.moe_strategy == "triton_no_quant_custom_ar")
+
+    def get_attributes(self) -> StrategyAttributes:
+        from rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.executors.triton_fused_moe_executor import (
+            TritonFusedMoeExecutor,
+        )
+        from rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.routers.cross_device_reduce_router import (
+            CrossDeviceReduceRouterNoQuant,
+        )
+
+        return StrategyAttributes(
+            router_class=CrossDeviceReduceRouterNoQuant,
+            executor_class=TritonFusedMoeExecutor,
+            quant_config=FusedMoEQuantConfig(quant_dtype=None),
+        )
+
+
 class CudaTritonFp8PerTensorStrategy(MoeStrategy):
     """FP8 per-tensor (per-token activation) Triton fused MoE on PureTP routing."""
 

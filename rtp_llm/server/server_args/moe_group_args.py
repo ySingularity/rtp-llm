@@ -172,6 +172,7 @@ def init_moe_group_args(parser, moe_config, eplb_config, deep_ep_config):
             "fp4_ep_normal",
             "fp4_no_dp",
             "triton_no_quant",
+            "triton_no_quant_custom_ar",
             "triton_fp8_per_tensor",
             "triton_fp8_per_block",
             "triton_fp8_per_block_custom_ar",

@@ -78,6 +78,7 @@ else:
         CudaTritonFp8PerBlockDpTpStrategy,
         CudaTritonFp8PerBlockStrategy,
         CudaTritonFp8PerTensorStrategy,
+        CudaTritonNoQuantCustomARStrategy,
         CudaTritonNoQuantStrategy,
         CudaW4a8Int4PerChannelEpLowLatencyStrategy,
         CudaW4a8Int4PerChannelEpNormalStrategy,
@@ -97,6 +98,7 @@ else:
     registry.register(CudaNoQuantCppStrategy())
     # sglang TritonRunnerCore port (no DeepEP). Gated by explicit moe_strategy.
     registry.register(CudaTritonNoQuantStrategy())
+    registry.register(CudaTritonNoQuantCustomARStrategy())
     registry.register(CudaTritonFp8PerTensorStrategy())
     registry.register(CudaTritonFp8PerBlockStrategy())
     registry.register(CudaTritonFp8PerBlockCustomARStrategy())

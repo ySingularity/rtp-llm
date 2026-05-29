@@ -32,6 +32,7 @@ from rtp_llm.models_py.modules.factory.fused_moe.defs.quant_config import (
 )
 from rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.routers.pure_tp_router import (
     PureTpRouterFp8PerBlockTriton,
+    PureTpRouterNoQuant,
 )
 from rtp_llm.models_py.modules.factory.fused_moe.utils.config_resolver import (
     MoeConfigResolver,
@@ -63,7 +64,131 @@ def _get_custom_ar_ops():
     return _Ops()
 
 
-class CrossDeviceReduceRouterFp8PerBlock(PureTpRouterFp8PerBlockTriton):
+class _CustomARMixin:
+    """IPC-based custom allreduce setup/teardown shared by router variants.
+
+    Host class must set ``self.tp_size`` and ``self._tp_rank`` before calling
+    ``_init_custom_ar()``. After successful init, ``self._custom_ar_enabled``
+    is True and ``_custom_ar_or_fallback()`` performs the AR with NCCL
+    fallback for oversized or misaligned tensors.
+    """
+
+    def _init_custom_ar(self) -> None:
+        self._custom_ar_enabled = False
+        if self.tp_size > 1:
+            try:
+                self._setup_custom_allreduce()
+            except Exception as e:
+                logger.warning(
+                    "Custom allreduce setup failed, falling back to NCCL: %s", e
+                )
+                self._custom_ar_enabled = False
+
+    def _setup_custom_allreduce(self) -> None:
+        custom_ar = _get_custom_ar_ops()
+
+        meta_sz = custom_ar.meta_size()
+        self._max_ar_size = 8 * 1024 * 1024
+        buf_size = meta_sz + self._max_ar_size
+        self._buffer_ptr, self._ipc_handle = (
+            custom_ar.allocate_shared_buffer_and_handle(buf_size)
+        )
+
+        tp_group = _get_group(Group.TP)
+        all_handles = [None] * self.tp_size
+        torch.distributed.all_gather_object(
+            all_handles, self._ipc_handle, group=tp_group
+        )
+
+        ipc_ptrs = []
+        for i in range(self.tp_size):
+            if i == self._tp_rank:
+                ipc_ptrs.append(self._buffer_ptr)
+            else:
+                ipc_ptrs.append(custom_ar.open_mem_handle(all_handles[i]))
+
+        rank_data = torch.zeros(
+            16 * 1024 * 1024,
+            dtype=torch.uint8,
+            device=f"cuda:{torch.cuda.current_device()}",
+        )
+        self._fa_ptr = custom_ar.init_custom_ar(
+            ipc_ptrs, rank_data, self._tp_rank, True
+        )
+        self._rank_data = rank_data
+
+        data_ptrs = [ptr + meta_sz for ptr in ipc_ptrs]
+        custom_ar.register_buffer(self._fa_ptr, data_ptrs)
+        self._reg_buffer = data_ptrs[self._tp_rank]
+        self._custom_ar = custom_ar
+        self._custom_ar_enabled = True
+
+        self._post_capture_cb = self._register_graph_buffers
+        register_post_capture_callback(self._post_capture_cb)
+
+        logger.info(
+            "Custom allreduce initialized: tp_rank=%d, tp_size=%d, "
+            "meta_size=%d, max_ar_size=%d",
+            self._tp_rank,
+            self.tp_size,
+            meta_sz,
+            self._max_ar_size,
+        )
+
+    def _register_graph_buffers(self) -> None:
+        """Exchange IPC handles for graph-captured buffers and register them.
+
+        Called by C++ finish_capture_session() after each CUDA graph capture.
+        """
+        handle_and_offsets = self._custom_ar.get_graph_buffer_ipc_meta(self._fa_ptr)
+        handles, offsets = handle_and_offsets
+        if not offsets:
+            return
+
+        tp_group = _get_group(Group.TP)
+        all_handles = [None] * self.tp_size
+        all_offsets = [None] * self.tp_size
+        torch.distributed.all_gather_object(all_handles, handles, group=tp_group)
+        torch.distributed.all_gather_object(all_offsets, offsets, group=tp_group)
+        self._custom_ar.register_graph_buffers(self._fa_ptr, all_handles, all_offsets)
+        logger.debug(
+            "Registered %d graph buffers for custom AR (tp_rank=%d)",
+            len(offsets),
+            self._tp_rank,
+        )
+
+    def _custom_ar_or_fallback(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Run IPC custom AR if available and size fits, else NCCL fallback."""
+        if self._custom_ar_enabled:
+            inp_size = tensor.numel() * tensor.element_size()
+            if inp_size <= self._max_ar_size and inp_size % 16 == 0:
+                result = torch.empty_like(tensor)
+                self._custom_ar.all_reduce(
+                    self._fa_ptr,
+                    tensor,
+                    result,
+                    self._reg_buffer,
+                    self._max_ar_size,
+                )
+                return result
+        return all_reduce(tensor, group=Group.TP)
+
+    def _dispose_custom_ar(self) -> None:
+        if hasattr(self, "_post_capture_cb"):
+            unregister_post_capture_callback(self._post_capture_cb)
+        if hasattr(self, "_fa_ptr") and hasattr(self, "_custom_ar"):
+            try:
+                self._custom_ar.dispose(self._fa_ptr)
+            except Exception:
+                pass
+        if hasattr(self, "_buffer_ptr") and hasattr(self, "_custom_ar"):
+            try:
+                self._custom_ar.free_shared_buffer(self._buffer_ptr)
+            except Exception:
+                pass
+
+
+class CrossDeviceReduceRouterFp8PerBlock(_CustomARMixin, PureTpRouterFp8PerBlockTriton):
     """FP8 per-block router that uses pre-compiled custom allreduce for finalize.
 
     Extends PureTpRouterFp8PerBlockTriton — inherits FP8 per-block quant with
@@ -105,91 +230,7 @@ class CrossDeviceReduceRouterFp8PerBlock(PureTpRouterFp8PerBlockTriton):
             self.use_external_dp_gather = (
                 os.environ.get("MOE_EXTERNAL_DP_GATHER", "1") != "0"
             )
-        self._custom_ar_enabled = False
-        if self.tp_size > 1:
-            try:
-                self._setup_custom_allreduce()
-            except Exception as e:
-                logger.warning(
-                    "Custom allreduce setup failed, falling back to NCCL: %s", e
-                )
-                self._custom_ar_enabled = False
-
-    def _setup_custom_allreduce(self):
-        custom_ar = _get_custom_ar_ops()
-
-        meta_sz = custom_ar.meta_size()
-        self._max_ar_size = 8 * 1024 * 1024
-        buf_size = meta_sz + self._max_ar_size
-        self._buffer_ptr, self._ipc_handle = (
-            custom_ar.allocate_shared_buffer_and_handle(buf_size)
-        )
-
-        tp_group = _get_group(Group.TP)
-        all_handles = [None] * self.tp_size
-        torch.distributed.all_gather_object(
-            all_handles, self._ipc_handle, group=tp_group
-        )
-
-        ipc_ptrs = []
-        for i in range(self.tp_size):
-            if i == self._tp_rank:
-                ipc_ptrs.append(self._buffer_ptr)
-            else:
-                ipc_ptrs.append(custom_ar.open_mem_handle(all_handles[i]))
-
-        rank_data = torch.zeros(
-            16 * 1024 * 1024,
-            dtype=torch.uint8,
-            device=f"cuda:{torch.cuda.current_device()}",
-        )
-        self._fa_ptr = custom_ar.init_custom_ar(
-            ipc_ptrs, rank_data, self._tp_rank, True
-        )
-        self._rank_data = rank_data
-
-        data_ptrs = [ptr + meta_sz for ptr in ipc_ptrs]
-        custom_ar.register_buffer(self._fa_ptr, data_ptrs)
-        self._reg_buffer = data_ptrs[self.ep_rank]
-        self._custom_ar = custom_ar
-        self._custom_ar_enabled = True
-
-        self._post_capture_cb = self._register_graph_buffers
-        register_post_capture_callback(self._post_capture_cb)
-
-        logger.info(
-            "Custom allreduce initialized: tp_rank=%d, tp_size=%d, "
-            "meta_size=%d, max_ar_size=%d",
-            self._tp_rank,
-            self.tp_size,
-            meta_sz,
-            self._max_ar_size,
-        )
-
-    def _register_graph_buffers(self):
-        """Exchange IPC handles for graph-captured buffers and register them.
-
-        Called by C++ finish_capture_session() after each CUDA graph capture.
-        The custom allreduce kernel records unregistered buffer pointers during
-        capture in graph_unreg_buffers_. This method exchanges their IPC handles
-        across TP ranks and fills in the peer pointers so graph replay works.
-        """
-        handle_and_offsets = self._custom_ar.get_graph_buffer_ipc_meta(self._fa_ptr)
-        handles, offsets = handle_and_offsets
-        if not offsets:
-            return
-
-        tp_group = _get_group(Group.TP)
-        all_handles = [None] * self.tp_size
-        all_offsets = [None] * self.tp_size
-        torch.distributed.all_gather_object(all_handles, handles, group=tp_group)
-        torch.distributed.all_gather_object(all_offsets, offsets, group=tp_group)
-        self._custom_ar.register_graph_buffers(self._fa_ptr, all_handles, all_offsets)
-        logger.debug(
-            "Registered %d graph buffers for custom AR (tp_rank=%d)",
-            len(offsets),
-            self._tp_rank,
-        )
+        self._init_custom_ar()
 
     def finalize(
         self,
@@ -223,46 +264,56 @@ class CrossDeviceReduceRouterFp8PerBlock(PureTpRouterFp8PerBlockTriton):
             return all_reduce(out, group=Group.DP_AND_TP)
 
         # Pure TP (dp=1): custom AR or NCCL within TP group.
-        if self._custom_ar_enabled:
-            inp_size = out.numel() * out.element_size()
-            if inp_size <= self._max_ar_size and inp_size % 16 == 0:
-                result = torch.empty_like(out)
-                self._custom_ar.all_reduce(
-                    self._fa_ptr,
-                    out,
-                    result,
-                    self._reg_buffer,
-                    self._max_ar_size,
-                )
-                return result
-
-        return all_reduce(out, group=Group.TP)
+        return self._custom_ar_or_fallback(out)
 
     def allreduce(self, tensor: torch.Tensor) -> torch.Tensor:
-        if self._custom_ar_enabled:
-            inp_size = tensor.numel() * tensor.element_size()
-            if inp_size <= self._max_ar_size and inp_size % 16 == 0:
-                result = torch.empty_like(tensor)
-                self._custom_ar.all_reduce(
-                    self._fa_ptr,
-                    tensor,
-                    result,
-                    self._reg_buffer,
-                    self._max_ar_size,
-                )
-                return result
-        return all_reduce(tensor, group=Group.TP)
+        return self._custom_ar_or_fallback(tensor)
 
     def __del__(self):
-        if hasattr(self, "_post_capture_cb"):
-            unregister_post_capture_callback(self._post_capture_cb)
-        if hasattr(self, "_fa_ptr") and hasattr(self, "_custom_ar"):
-            try:
-                self._custom_ar.dispose(self._fa_ptr)
-            except Exception:
-                pass
-        if hasattr(self, "_buffer_ptr") and hasattr(self, "_custom_ar"):
-            try:
-                self._custom_ar.free_shared_buffer(self._buffer_ptr)
-            except Exception:
-                pass
+        self._dispose_custom_ar()
+
+
+class CrossDeviceReduceRouterNoQuant(_CustomARMixin, PureTpRouterNoQuant):
+    """BF16/FP16 router that uses pre-compiled custom allreduce for finalize.
+
+    Extends PureTpRouterNoQuant — no-quant pass-through with all-reduce
+    finalize. Overrides __init__ (IPC setup), finalize() (custom AR with
+    NCCL fallback), and exposes allreduce() so attention layers can share
+    the same IPC channel.
+
+    Pure TP topology only (single-GPU or tp == ep). DP+EP is not supported
+    on the no-quant Triton path.
+    """
+
+    @classmethod
+    def check_conditions(cls, checker: Any, config: MoEConfigAdapter) -> None:
+        super().check_conditions(checker, config)
+
+    def __init__(
+        self,
+        config: MoEConfigAdapter,
+        quant_config: FusedMoEQuantConfig,
+    ):
+        super().__init__(config, quant_config)
+        self._tp_rank = config.tp_rank
+        self._init_custom_ar()
+
+    def finalize(
+        self,
+        payload: CombineForwardPayload,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        apply_router_weight_on_input: bool,
+        extra_finalize_args: Optional[dict[str, Any]],
+        skip_allreduce: bool = False,
+    ) -> torch.Tensor:
+        out = payload.fused_expert_output
+        if skip_allreduce or self.tp_size <= 1:
+            return out
+        return self._custom_ar_or_fallback(out)
+
+    def allreduce(self, tensor: torch.Tensor) -> torch.Tensor:
+        return self._custom_ar_or_fallback(tensor)
+
+    def __del__(self):
+        self._dispose_custom_ar()
