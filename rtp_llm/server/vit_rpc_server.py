@@ -31,9 +31,7 @@ from rtp_llm.utils.grpc_util import trans_from_tensor, trans_tensor
 
 def trans_output(res: MMEmbeddingRes):
     contain_pos = (res.position_ids is not None) and (len(res.position_ids) > 0)
-    contain_deepstack = (res.deepstack_embeds is not None) and (
-        len(res.deepstack_embeds) > 0
-    )
+    contain_extra_input = (res.extra_input is not None) and (len(res.extra_input) > 0)
 
     output_pb = MultimodalOutputPB(
         multimodal_embedding=trans_from_tensor(torch.concat(res.embeddings)),
@@ -43,10 +41,10 @@ def trans_output(res: MMEmbeddingRes):
         output_pb.multimodal_pos_id.CopyFrom(
             trans_from_tensor(torch.concat(res.position_ids))
         )
-    if contain_deepstack:
-        output_pb.multimodal_deepstack_embeds.CopyFrom(
-            trans_from_tensor(torch.concat(res.deepstack_embeds, dim=1))
-        )
+    if contain_extra_input:
+        # Each extra-input is an opaque flat 1-D tensor (one per image).
+        for extra in res.extra_input:
+            output_pb.multimodal_extra_input.append(trans_from_tensor(extra))
     return output_pb
 
 

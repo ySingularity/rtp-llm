@@ -285,14 +285,15 @@ class MMEmbeddingRes:
         self,
         embeddings: List[torch.Tensor],
         position_ids: Optional[List[torch.Tensor]] = None,
-        deepstack_embeds: Optional[List[torch.Tensor]] = None,
+        extra_input: Optional[List[torch.Tensor]] = None,
     ):
         self.embeddings = embeddings
         self.position_ids = position_ids if position_ids is not None else []
-        self.deepstack_embeds = deepstack_embeds if deepstack_embeds is not None else []
+        # Model-specific extra input, one opaque flat 1-D tensor per image (e.g. deepstack).
+        self.extra_input = extra_input if extra_input is not None else []
 
     def __str__(self) -> str:
-        return f"MMEmbeddingRes(length={len(self.embeddings)}, embeddings_shape={[e.shape for e in self.embeddings]}, position_ids_shape={[p.shape for p in self.position_ids] if self.position_ids is not None else []}, deepstack_embeds_shape={[d.shape for d in self.deepstack_embeds] if self.deepstack_embeds is not None else []})"
+        return f"MMEmbeddingRes(length={len(self.embeddings)}, embeddings_shape={[e.shape for e in self.embeddings]}, position_ids_shape={[p.shape for p in self.position_ids] if self.position_ids is not None else []}, extra_input_shape={[d.shape for d in self.extra_input] if self.extra_input is not None else []})"
 
 
 class MMWorkItem:
@@ -471,12 +472,12 @@ class MMProcessEngine:
                         self._wait_for_preprocessing(work_items)
 
                     with torch.profiler.record_function("compute_embeddings"):
-                        emb_res, pos_res, deepstack_embeds_res = (
-                            self._compute_embeddings(work_items)
+                        emb_res, pos_res, extra_input_res = self._compute_embeddings(
+                            work_items
                         )
 
                     with torch.profiler.record_function("postprocess"):
-                        result = MMEmbeddingRes(emb_res, pos_res, deepstack_embeds_res)
+                        result = MMEmbeddingRes(emb_res, pos_res, extra_input_res)
 
                     if not self.vit_config.disable_access_log:
                         self._access_logger.log_success_access(mm_inputs, str(result))
@@ -564,7 +565,8 @@ class MMProcessEngine:
         for emb, pos, tensor in zip(ordered_emb, ordered_pos, ordered_tensor):
             emb_res.extend(self._maybe_tensor_to_list(emb, dim=2))
             pos_res.extend(self._maybe_tensor_to_list(pos, dim=2))
-            tensor_res.extend(self._maybe_tensor_to_list(tensor, dim=3))
+            # extra input is a flat 1-D tensor per image
+            tensor_res.extend(self._maybe_tensor_to_list(tensor, dim=1))
         return emb_res, pos_res, tensor_res
 
     def stop(self) -> None:
