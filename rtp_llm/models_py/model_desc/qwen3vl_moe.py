@@ -67,6 +67,7 @@ class Qwen3VLMoeModel(GptModelBase):
                     idx,
                     moe_config,
                     max_generate_batch_size,
+                    hw_kernel_config=py_hw_kernel_config,
                     enable_cuda_graph=enable_cuda_graph,
                 )
                 for idx in range(self.layer_num)
@@ -75,9 +76,6 @@ class Qwen3VLMoeModel(GptModelBase):
         self.norm = RMSResNorm(
             weights.get_global_weight(W.final_ln_gamma), eps=model_config.layernorm_eps
         )
-
-    def need_combo_position_ids(self) -> bool:
-        return True
 
     def forward(self, inputs: PyModelInputs, fmha_impl: Any = None) -> PyModelOutputs:
         input_ids: torch.Tensor = inputs.input_ids
