@@ -69,6 +69,7 @@ class TritonFusedMoeExecutor(FusedMoeExpertExecutor):
         self.num_experts = config.expert_num
         assert self.num_experts % self.ep_size == 0
         self.num_local_experts = self.num_experts // self.ep_size
+        self.start_expert_id = self.ep_rank * self.num_local_experts
         self.top_k = config.moe_k
 
         self.use_fp8_w8a8 = (
@@ -361,6 +362,25 @@ class TritonFusedMoeExecutor(FusedMoeExpertExecutor):
             a1_scale = None
 
         topk_ids = payload.expert_topk_ids.to(torch.int32)
+        topk_weights = payload.expert_topk_weights
+
+        # Translate GLOBAL topk_ids to LOCAL ids when EP is active and the
+        # router did not pre-translate. PureTpRouterNoQuant has
+        # do_recompute_topk=False so it passes through global ids unchanged;
+        # without this translation the downstream ``moe_align_block_size``
+        # filter ``raw < num_local_experts`` drops the actual local experts
+        # on ep_rank > 0 (whose global ids are in [start, start+num_local))
+        # and instead keeps OOB ids that index into the wrong weight rows.
+        # The OLD ``triton_fused_executor.py`` (used by no_auant_cpp strategy)
+        # has this same translation at lines 85-89; this executor was missing it.
+        if self.ep_size > 1:
+            local_ids = topk_ids - self.start_expert_id
+            local_mask = (local_ids >= 0) & (local_ids < self.num_local_experts)
+            topk_ids = local_ids.clamp(min=0, max=self.num_local_experts - 1).to(
+                torch.int32
+            )
+            topk_weights = topk_weights * local_mask
+
         # Output dtype must match the un-quantized model dtype, not the (FP8)
         # storage dtype of ``hidden_states`` after a router pre-quant.
         out_dtype = payload.expert_x_origin_dtype or hidden_states.dtype
@@ -418,7 +438,7 @@ class TritonFusedMoeExecutor(FusedMoeExpertExecutor):
             hidden_states=hidden_states.contiguous(),
             w1=self.w13_weight,
             w2=self.w2_weight,
-            topk_weights=payload.expert_topk_weights.contiguous(),
+            topk_weights=topk_weights.contiguous(),
             topk_ids=topk_ids.contiguous(),
             inplace=False,
             activation=act,
