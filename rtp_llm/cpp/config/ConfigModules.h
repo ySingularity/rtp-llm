@@ -292,7 +292,32 @@ struct SpeculativeExecutionConfig {
 
 struct VitConfig {
     VitSeparation vit_separation = VitSeparation::VIT_SEPARATION_LOCAL;
-    std::string   to_string() const;
+
+    // ---- Encoder(ViT) <-> LLM embedding transport over GPUDirect RDMA ----
+    // Master switch for the RDMA data-plane fast path. Control plane (gRPC
+    // RemoteMultimodalEmbedding negotiation) is unchanged. When disabled, or when
+    // any precondition fails, the embedding falls back to inline TensorPB bytes.
+    bool mm_rdma_enable = false;
+    // Encoder-side OOB bind IP for RdmaServer (LLM connects here to exchange QP info).
+    // Empty means auto-detect via getBindIp() (management network IP).
+    std::string mm_rdma_bind_ip;
+    // Encoder-side RdmaServer listen port (the LLM connects here for one-sided READ).
+    int mm_rdma_port = 0;
+    // Only embeddings >= this many bytes take the RDMA path; smaller ones stay inline
+    // (RDMA setup cost dominates for tiny tensors).
+    int64_t mm_rdma_min_bytes = 256L * 1024;
+    // RDMA client/server thread pools and connection params (mirror CacheStoreConfig).
+    int mm_rdma_connect_timeout_ms      = 250;
+    int mm_rdma_qp_count_per_connection = 2;
+    int mm_rdma_io_thread_count         = 2;
+    int mm_rdma_worker_thread_count     = 2;
+    // Max wait for a single READ to complete on the LLM side before giving up (fallback).
+    int64_t mm_rdma_read_timeout_ms = 30 * 1000;
+    // Encoder-side slot lifetime: force-reclaim a slot this long after export if no
+    // Release(handle) arrived (backstop against LLM crash / READ failure -> leak).
+    int64_t mm_rdma_slot_gc_timeout_ms = 60 * 1000;
+
+    std::string to_string() const;
 };
 
 struct CacheStoreConfig {

@@ -1542,19 +1542,49 @@ PYBIND11_MODULE(libth_transformer_config, m) {
     py::class_<VitConfig>(m, "VitConfig")
         .def(py::init<>())
         .def_readwrite("vit_separation", &VitConfig::vit_separation)
+        .def_readwrite("mm_rdma_enable", &VitConfig::mm_rdma_enable)
+        .def_readwrite("mm_rdma_port", &VitConfig::mm_rdma_port)
+        .def_readwrite("mm_rdma_min_bytes", &VitConfig::mm_rdma_min_bytes)
+        .def_readwrite("mm_rdma_connect_timeout_ms", &VitConfig::mm_rdma_connect_timeout_ms)
+        .def_readwrite("mm_rdma_qp_count_per_connection", &VitConfig::mm_rdma_qp_count_per_connection)
+        .def_readwrite("mm_rdma_io_thread_count", &VitConfig::mm_rdma_io_thread_count)
+        .def_readwrite("mm_rdma_worker_thread_count", &VitConfig::mm_rdma_worker_thread_count)
+        .def_readwrite("mm_rdma_read_timeout_ms", &VitConfig::mm_rdma_read_timeout_ms)
+        .def_readwrite("mm_rdma_slot_gc_timeout_ms", &VitConfig::mm_rdma_slot_gc_timeout_ms)
         .def("to_string", &VitConfig::to_string)
-        .def(py::pickle([](const VitConfig& self) { return py::make_tuple(self.vit_separation); },
-                        [](py::tuple t) {
-                            if (t.size() != 1)
-                                throw std::runtime_error("Invalid state!");
-                            VitConfig c;
-                            try {
-                                c.vit_separation = t[0].cast<VitSeparation>();
-                            } catch (const std::exception& e) {
-                                throw std::runtime_error(std::string("VitConfig unpickle error: ") + e.what());
-                            }
-                            return c;
-                        }));
+        .def(py::pickle(
+            [](const VitConfig& self) {
+                return py::make_tuple(self.vit_separation,
+                                      self.mm_rdma_enable,
+                                      self.mm_rdma_port,
+                                      self.mm_rdma_min_bytes,
+                                      self.mm_rdma_connect_timeout_ms,
+                                      self.mm_rdma_qp_count_per_connection,
+                                      self.mm_rdma_io_thread_count,
+                                      self.mm_rdma_worker_thread_count,
+                                      self.mm_rdma_read_timeout_ms,
+                                      self.mm_rdma_slot_gc_timeout_ms);
+            },
+            [](py::tuple t) {
+                if (t.size() != 10)
+                    throw std::runtime_error("Invalid state!");
+                VitConfig c;
+                try {
+                    c.vit_separation                  = t[0].cast<VitSeparation>();
+                    c.mm_rdma_enable                  = t[1].cast<bool>();
+                    c.mm_rdma_port                    = t[2].cast<int>();
+                    c.mm_rdma_min_bytes               = t[3].cast<int64_t>();
+                    c.mm_rdma_connect_timeout_ms      = t[4].cast<int>();
+                    c.mm_rdma_qp_count_per_connection = t[5].cast<int>();
+                    c.mm_rdma_io_thread_count         = t[6].cast<int>();
+                    c.mm_rdma_worker_thread_count     = t[7].cast<int>();
+                    c.mm_rdma_read_timeout_ms         = t[8].cast<int64_t>();
+                    c.mm_rdma_slot_gc_timeout_ms      = t[9].cast<int64_t>();
+                } catch (const std::exception& e) {
+                    throw std::runtime_error(std::string("VitConfig unpickle error: ") + e.what());
+                }
+                return c;
+            }));
 
     // Register PDSepConfig
     py::class_<PDSepConfig>(m, "PDSepConfig")

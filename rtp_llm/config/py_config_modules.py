@@ -251,6 +251,16 @@ class VitConfig:
         self.disable_access_log: bool = False
         self.use_local_preprocess: bool = False
         self.vit_proxy_load_balance_strategy: str = "round_robin"
+        # ---- Encoder(ViT)<->LLM embedding transport over GPUDirect RDMA ----
+        self.mm_rdma_enable: bool = False
+        self.mm_rdma_port: int = 0
+        self.mm_rdma_min_bytes: int = 256 * 1024
+        self.mm_rdma_connect_timeout_ms: int = 250
+        self.mm_rdma_qp_count_per_connection: int = 2
+        self.mm_rdma_io_thread_count: int = 2
+        self.mm_rdma_worker_thread_count: int = 2
+        self.mm_rdma_read_timeout_ms: int = 30 * 1000
+        self.mm_rdma_slot_gc_timeout_ms: int = 60 * 1000
 
     def to_string(self):
         return (
@@ -274,7 +284,16 @@ class VitConfig:
             f"local_extra_data_path: {self.local_extra_data_path}\n"
             f"disable_access_log: {self.disable_access_log}\n"
             f"use_local_preprocess: {self.use_local_preprocess}\n"
-            f"vit_proxy_load_balance_strategy: {self.vit_proxy_load_balance_strategy}"
+            f"vit_proxy_load_balance_strategy: {self.vit_proxy_load_balance_strategy}\n"
+            f"mm_rdma_enable: {self.mm_rdma_enable}\n"
+            f"mm_rdma_port: {self.mm_rdma_port}\n"
+            f"mm_rdma_min_bytes: {self.mm_rdma_min_bytes}\n"
+            f"mm_rdma_connect_timeout_ms: {self.mm_rdma_connect_timeout_ms}\n"
+            f"mm_rdma_qp_count_per_connection: {self.mm_rdma_qp_count_per_connection}\n"
+            f"mm_rdma_io_thread_count: {self.mm_rdma_io_thread_count}\n"
+            f"mm_rdma_worker_thread_count: {self.mm_rdma_worker_thread_count}\n"
+            f"mm_rdma_read_timeout_ms: {self.mm_rdma_read_timeout_ms}\n"
+            f"mm_rdma_slot_gc_timeout_ms: {self.mm_rdma_slot_gc_timeout_ms}"
         )
 
 
