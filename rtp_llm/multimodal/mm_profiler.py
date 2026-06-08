@@ -8,15 +8,56 @@ from typing import Any, Dict, List, Optional
 import torch
 import torch.profiler
 
+# Global list to collect CPU preprocess trace events from subprocess workers.
+# Populated by MultiprocessPreprocessExecutor.get_result() when _trace_enabled is True.
+_preprocess_trace_events: List[Dict[str, Any]] = []
+
+# Global list to collect gRPC handler transport events.
+# Populated by vit_rpc_server.py when _trace_enabled is True.
+# Approximates "GPU done -> data packed into PB" cost (D2H + concat + memcpy);
+# excludes gRPC wire encode and network.
+_grpc_trace_events: List[Dict[str, Any]] = []
+_grpc_trace_lock = threading.Lock()
+
+# Module-level flag: set True by MMProfiler.start_profile(), cleared by end_profile().
+# Checked by MultiprocessPreprocessExecutor.get_result() to decide whether to collect events.
+_trace_enabled: bool = False
+
+
+def record_preprocess_trace(info: Dict[str, Any]) -> None:
+    """No-op when profiling is off; otherwise append a CPU preprocess trace event."""
+    if not _trace_enabled:
+        return
+    _preprocess_trace_events.append(info)
+
+
+def record_grpc_trace(start_us: int, end_us: int, tid: int) -> None:
+    """No-op when profiling is off; otherwise append a gRPC transport trace event."""
+    if not _trace_enabled:
+        return
+    info = {
+        "tid": tid,
+        "start_us": start_us,
+        "end_us": end_us,
+        "dur_ms": (end_us - start_us) / 1000.0,
+    }
+    with _grpc_trace_lock:
+        _grpc_trace_events.append(info)
+
 
 class MMProfiler:
-    """Per-request profiler using ``torch.profiler.profile`` as a context
-    manager so that start/stop always happen on the **same worker thread**.
+    """Global profiler for concurrent request analysis.
 
-    Only one request is profiled at a time (serialised by ``_profile_slot``).
-    Other concurrent requests run without profiling overhead.  Each profiled
-    request produces ``timeline_<N>.json``; at the end a merged ``summary.txt``
-    and ``top_operations.json`` are generated from the last request's data.
+    Uses a single torch.profiler.profile started/stopped on the HTTP thread.
+    Captures CUDA kernels, cuda_runtime calls, and memory operations from ALL
+    threads.  record_function annotations only appear for the HTTP thread, but
+    GPU events and cuda_runtime calls from all worker threads are captured —
+    this is sufficient to analyze concurrency.
+
+    Usage:
+      1. POST /start_profile  — starts global profiler immediately
+      2. Send concurrent requests — all GPU/runtime activity is captured
+      3. POST /end_profile   — stops profiler, exports one timeline.json
     """
 
     def __init__(self):
@@ -27,7 +68,7 @@ class MMProfiler:
         self._output_path = "./vit_profile"
 
         self._profile_cfg: Dict[str, Any] = {}
-        self._profile_slot = threading.Lock()  # only 1 request profiled at a time
+        self._prof: Optional[torch.profiler.profile] = None
         self._last_averages: Optional[Any] = None
         self._finished = False
 
@@ -69,18 +110,38 @@ class MMProfiler:
             }
             self._last_averages = None
             self._finished = False
-            self._armed = True
 
-            logging.info(
-                f"MMProfiler: armed for {count} requests, output={self._output_path}"
-            )
-            return {
-                "status": "started",
-                "target_count": count,
-                "output_path": self._output_path,
-            }
+        # Start profiler OUTSIDE the lock (on HTTP thread)
+        activities = [torch.profiler.ProfilerActivity.CPU]
+        if torch.cuda.is_available():
+            activities.append(torch.profiler.ProfilerActivity.CUDA)
+
+        prof = torch.profiler.profile(
+            activities=activities,
+            record_shapes=record_shapes,
+            profile_memory=profile_memory,
+            with_stack=with_stack,
+        )
+        prof.__enter__()
+
+        global _trace_enabled
+        with self._lock:
+            self._prof = prof
+            self._armed = True
+            _trace_enabled = True
+
+        logging.info(
+            f"MMProfiler: global profiler started, target={count}, "
+            f"output={self._output_path}"
+        )
+        return {
+            "status": "started",
+            "target_count": count,
+            "output_path": self._output_path,
+        }
 
     def end_profile(self) -> Dict[str, Any]:
+        global _trace_enabled
         with self._lock:
             if not self._armed and not self._finished:
                 return {
@@ -88,10 +149,41 @@ class MMProfiler:
                     "message": "No profiling session (call /start_profile first)",
                 }
 
+            prof = self._prof
+            self._prof = None
             self._armed = False
-
+            _trace_enabled = False
+            self._finished = True
             profiled = self._profiled_count
             target = self._target_count
+
+        # Stop profiler on HTTP thread (same thread as start_profile)
+        if prof is not None:
+            try:
+                prof.__exit__(None, None, None)
+                logging.info("MMProfiler: profiler stopped")
+            except Exception as e:
+                logging.error(f"MMProfiler: error stopping profiler: {e}")
+
+            trace_file = os.path.join(self._output_path, "timeline.json")
+            try:
+                prof.export_chrome_trace(trace_file)
+                logging.info(f"MMProfiler: trace exported to {trace_file}")
+            except Exception as e:
+                logging.error(f"MMProfiler: export failed: {e}")
+
+            try:
+                self._last_averages = prof.key_averages()
+            except Exception:
+                pass
+
+        # Export CPU preprocess trace (subprocess timing)
+        self._export_preprocess_trace()
+
+        # Export gRPC transport trace (gRPC thread timing)
+        self._export_grpc_trace()
+
+        with self._lock:
             averages = self._last_averages
             self._last_averages = None
             finished = self._finished
@@ -142,85 +234,99 @@ class MMProfiler:
 
     @contextmanager
     def profile_request(self):
-        """Wrap request computation.  If profiling is armed, the request
-        waits for its turn (only one profiled at a time to avoid CUPTI
-        conflicts), then runs with full CPU + GPU tracing on the same
-        worker thread.  Non-profiled requests pass through immediately.
+        """Pass-through context manager.  The global profiler captures all
+        GPU/runtime activity from all threads automatically.  This just
+        tracks the request count.
         """
-        with self._lock:
-            want_profile = self._armed and self._profiled_count < self._target_count
-
-        if not want_profile:
-            yield
-            return
-
-        # Wait for the single-profile slot (CUPTI requires serialized profilers).
-        self._profile_slot.acquire()
-
-        # Re-check state after acquiring the slot: armed/target_count may have
-        # changed while we were waiting.  Decide bail vs. profile under _lock,
-        # then drop _lock before doing any long work (yield / profiler setup).
-        with self._lock:
-            if self._armed and self._profiled_count < self._target_count:
-                request_idx = self._profiled_count
-            else:
-                request_idx = None
-
-        if request_idx is None:
-            # Bail out: release the slot BEFORE yielding so that neither lock is
-            # held during request execution; otherwise start/end/get_status and
-            # subsequent profile_request callers would all block on this request.
-            self._profile_slot.release()
-            yield
-            return
-
         try:
-            activities = [torch.profiler.ProfilerActivity.CPU]
-            if torch.cuda.is_available():
-                activities.append(torch.profiler.ProfilerActivity.CUDA)
-
-            cfg = self._profile_cfg
-            prof = torch.profiler.profile(
-                activities=activities,
-                record_shapes=cfg.get("record_shapes", True),
-                profile_memory=cfg.get("profile_memory", True),
-                with_stack=cfg.get("with_stack", True),
-            )
-
-            try:
-                with prof:
-                    yield
-            finally:
-                trace_file = os.path.join(
-                    self._output_path, f"timeline_{request_idx}.json"
-                )
-                try:
-                    prof.export_chrome_trace(trace_file)
-                except Exception as e:
-                    logging.error(
-                        f"MMProfiler: export failed for request {request_idx}: {e}"
-                    )
-
-                try:
-                    self._last_averages = prof.key_averages()
-                except Exception:
-                    pass
-
-                with self._lock:
-                    self._profiled_count += 1
-                    logging.info(
-                        f"MMProfiler: profiled {self._profiled_count}/{self._target_count}"
-                    )
-                    if self._profiled_count >= self._target_count:
-                        self._armed = False
-                        self._finished = True
-                        logging.info("MMProfiler: all requests profiled")
+            yield
         finally:
-            self._profile_slot.release()
+            with self._lock:
+                if self._armed:
+                    self._profiled_count += 1
 
     # ------------------------------------------------------------------ #
     #  Helpers
     # ------------------------------------------------------------------ #
+
+    def _export_preprocess_trace(self):
+        """Export collected CPU preprocess events as a chrome trace JSON.
+
+        Each event shows when a subprocess worker started/finished preprocessing
+        an image, allowing visualization of parallelism in Perfetto.
+        """
+        global _preprocess_trace_events
+        if not _preprocess_trace_events:
+            return
+
+        events = []
+        for i, info in enumerate(_preprocess_trace_events):
+            events.append({
+                "ph": "X",
+                "cat": "cpu_preprocess",
+                "name": f"preprocess_image_{i}",
+                "pid": info["pid"],
+                "tid": info["pid"],
+                "ts": info["start_us"],
+                "dur": info["end_us"] - info["start_us"],
+                "args": {"worker_pid": info["pid"], "dur_ms": info["dur_ms"]},
+            })
+
+        trace_data = {"traceEvents": events}
+        trace_file = os.path.join(self._output_path, "cpu_preprocess_trace.json")
+        try:
+            with open(trace_file, "w") as f:
+                json.dump(trace_data, f, indent=2)
+            logging.info(
+                f"MMProfiler: CPU preprocess trace exported to {trace_file} "
+                f"({len(events)} events)"
+            )
+        except Exception as e:
+            logging.error(f"MMProfiler: CPU preprocess trace export failed: {e}")
+
+        _preprocess_trace_events.clear()
+
+    def _export_grpc_trace(self):
+        """Export collected gRPC handler transport events as a chrome trace JSON.
+
+        Each event approximates one request's "GPU done -> packed into PB" cost
+        (D2H copy + concat + memcpy into protobuf). Does NOT include gRPC wire
+        encode or network transfer.
+        """
+        global _grpc_trace_events
+        with _grpc_trace_lock:
+            if not _grpc_trace_events:
+                return
+            events_copy = list(_grpc_trace_events)
+            _grpc_trace_events.clear()
+
+        trace_events = []
+        for i, info in enumerate(events_copy):
+            trace_events.append({
+                "ph": "X",
+                "cat": "grpc_transport",
+                "name": f"grpc_transport_req_{i}",
+                "pid": info["tid"],
+                "tid": info["tid"],
+                "ts": info["start_us"],
+                "dur": info["end_us"] - info["start_us"],
+                "args": {
+                    "thread_id": info["tid"],
+                    "dur_ms": info["dur_ms"],
+                },
+            })
+
+        trace_data = {"traceEvents": trace_events}
+        trace_file = os.path.join(self._output_path, "grpc_transport_trace.json")
+        try:
+            with open(trace_file, "w") as f:
+                json.dump(trace_data, f, indent=2)
+            logging.info(
+                f"MMProfiler: gRPC transport trace exported to {trace_file} "
+                f"({len(events_copy)} events)"
+            )
+        except Exception as e:
+            logging.error(f"MMProfiler: gRPC transport trace export failed: {e}")
 
     @staticmethod
     def _collect_trace_files(output_path: str) -> Dict[str, Any]:
@@ -229,7 +335,7 @@ class MMProfiler:
             traces = sorted(
                 f
                 for f in os.listdir(output_path)
-                if f.startswith("timeline_") and f.endswith(".json")
+                if f.endswith(".json") and ("timeline" in f or "trace" in f)
             )
             files["traces"] = [os.path.join(output_path, f) for f in traces]
         except OSError:
