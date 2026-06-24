@@ -71,3 +71,25 @@ def sm8x_suites():
         ],
     )
 
+    # SM8x Qwen3.5 Omni (L20D, multimodal audio+vision)
+    native.test_suite(
+        name = "smoke_sm8x_omni",
+        tests = [
+            smoke_test(
+                name="qwen35_omni_basic",
+                task_info="data/model/qwen3_5_omni/q_r_omni_basic.json",
+                smoke_args="--act_type BF16 --tp_size 4 --world_size 4 --reserver_runtime_mem_mb 10000 --max_seq_len 16384 --seq_size_per_block 2048 --kernel_seq_size_per_block 64 --ssm_state_dtype fp32",
+                envs=[
+                    "TRITON_AUTOTUNE_CACHE_MODE=cached",
+                    "AUDIO_TOKENIZER_PATH=/home/xieshui.yyx/happymusic/happy_music_tokenizer/model.ckpt",
+                    "CC=/usr/bin/gcc",
+                    "CXX=/usr/bin/g++",
+                    "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True",
+                    "FLASHINFER_DISABLE_VERSION_CHECK=1",
+                    "CUDA_VISIBLE_DEVICES=4,5,6,7",
+                ],
+                gpu_type=["L20"],
+            ),
+        ],
+    )
+

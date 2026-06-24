@@ -203,16 +203,21 @@ class Pipeline(object):
                 ExceptionType.EMPTY_PROMPT_ERROR,
                 "prompt should have at least one token!",
             )
-        if type(prompt) is not str:
+        # token-id list input: skip tokenization, use raw ids directly.
+        # Needed for tokens with no string form (e.g. audio codec tokens).
+        if isinstance(prompt, list):
+            token_ids = [int(t) for t in prompt]
+        elif type(prompt) is str:
+            # 生成式推荐：由开关控制，默认关闭、对非推荐场景零侵入。
+            # 在 tokenizer.encode(prompt) 之前解析及填充 banned_combo_token_ids，
+            # 避免重复编码 prompt。
+            parse_and_fill_banned_combo(prompt, generate_config, self.tokenizer)
+            token_ids = self.tokenizer.encode(prompt)
+        else:
             raise FtRuntimeException(
                 ExceptionType.ERROR_INPUT_FORMAT_ERROR,
-                "expect string prompt, actual: " + str(prompt),
+                "expect string or token-id list prompt, actual: " + str(prompt),
             )
-        # 生成式推荐：由开关控制，默认关闭、对非推荐场景零侵入。
-        # 在 tokenizer.encode(prompt) 之前解析及填充 banned_combo_token_ids，
-        # 避免重复编码 prompt。
-        parse_and_fill_banned_combo(prompt, generate_config, self.tokenizer)
-        token_ids = self.tokenizer.encode(prompt)
 
         if generate_config.sp_advice_prompt != "":
             generate_config.sp_advice_prompt_token_ids = self.tokenizer.encode(

@@ -37,6 +37,7 @@ from .jina_bert.jina_bert import JinaBert
 from .kimi_linear.kimi_linear import KimiLinear
 from .megatron_bert import MegatronBert
 from .mixtral import Mixtral
+from .qwen3_next.qwen3_5_omni import Qwen35Omni
 from .qwen3_next.qwen3_next import Qwen3Next
 from .qwen3_next.qwen3_next_mtp import Qwen3NextMTP
 from .qwen_v2_moe import Qwen2Moe

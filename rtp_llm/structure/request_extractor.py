@@ -119,6 +119,13 @@ class RequestExtractor:
             # for AutoML format
             elif isinstance(prompt, list) and isinstance(prompt[0], dict):
                 input_texts = [prompt]
+            # token-id list input (single prompt expressed as raw token ids)
+            elif (
+                isinstance(prompt, list)
+                and len(prompt) > 0
+                and isinstance(prompt[0], int)
+            ):
+                input_texts = [prompt]
             else:
                 input_texts = prompt
         if input_texts is None:

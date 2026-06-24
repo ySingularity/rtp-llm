@@ -232,7 +232,17 @@ void CudaGraphRunner::prepareInputs(const PyModelInputs& inputs, CudaGraphState&
                        py_model_inputs_.attention_inputs.prefix_lengths,
                        state.current_batch_size * sizeof(int));
 
-    // Common H2H strided copies for kv_cache block tables (both decode & prefill)
+    // Common H2H strided copies for kv_cache block tables (both decode & prefill).
+    // Symmetric with kv_cache_kernel_block_id_device.fill_(0) above (and the by_group
+    // tables): the single 2-D HOST table feeds the full-attn (group 0) flashinfer page
+    // table during cuda-graph replay. stridedCopyHost only refreshes the current
+    // request's columns; without this zeroing, columns beyond that width retain stale
+    // physical block ids from prior requests, so a later mixed/long decode dereferences
+    // a foreign block -> full-attn KV pollution (collapse). Zero == reserved block 0.
+    if (py_model_inputs_.attention_inputs.kv_cache_kernel_block_id_host.defined()
+        && py_model_inputs_.attention_inputs.kv_cache_kernel_block_id_host.numel() > 0) {
+        py_model_inputs_.attention_inputs.kv_cache_kernel_block_id_host.fill_(0);
+    }
     stridedCopyHost(inputs.attention_inputs.kv_cache_kernel_block_id_host,
                     py_model_inputs_.attention_inputs.kv_cache_kernel_block_id_host);
 

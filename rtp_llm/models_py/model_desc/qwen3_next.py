@@ -952,6 +952,10 @@ class Qwen3NextDecoderLayer(nn.Module):
                 config.quant_config,
                 hw_kernel_config=hw_kernel_config,
             )
+            # populate layer_idx (CausalAttention defaults to 0 since Qwen3NextAttention
+            # doesn't forward it through its __init__); needed for correct debug labels
+            # and for layer-distinguishing logic.
+            self.self_attn.layer_idx = layer_idx
 
         if config.moe_style == 2:
             self.mlp = GenericMoeLayer(
